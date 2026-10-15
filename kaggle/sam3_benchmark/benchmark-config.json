@@ -1,0 +1,18 @@
+{
+  "schema": "autolabel-sam3-benchmark-config/v1",
+  "max_total_seconds": 7200,
+  "max_config_seconds": 900,
+  "source_frame_limit": 600,
+  "configurations": [
+    {"id": "optical-current", "selection": "optical", "gap": null, "window_size": 50, "overlap": 0, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"},
+    {"id": "optical-overlap-50", "selection": "optical", "gap": null, "window_size": 50, "overlap": 5, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"},
+    {"id": "uniform-5-window-25", "selection": "uniform", "gap": 5, "window_size": 25, "overlap": 5, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"},
+    {"id": "uniform-10-window-50", "selection": "uniform", "gap": 10, "window_size": 50, "overlap": 5, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"},
+    {"id": "uniform-20-window-100", "selection": "uniform", "gap": 20, "window_size": 100, "overlap": 10, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"},
+    {"id": "optical-mask-reprompt", "selection": "optical", "gap": null, "window_size": 50, "overlap": 5, "mode": "box_seed", "seed_type": "box", "reprompt": "mask_last"},
+    {"id": "optical-mask-seed", "selection": "optical", "gap": null, "window_size": 50, "overlap": 5, "mode": "box_seed", "seed_type": "mask", "reprompt": "mask_last"},
+    {"id": "optical-window-100", "selection": "optical", "gap": null, "window_size": 100, "overlap": 10, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"},
+    {"id": "optical-text", "selection": "optical", "gap": null, "window_size": 50, "overlap": 5, "mode": "text_prompt", "seed_type": "none", "reprompt": "none", "text_prompts": ["car", "truck", "bus", "person", "motorcycle", "bicycle"]}
+  ],
+  "optional_dense_configuration": {"id": "dense-reference", "selection": "dense", "gap": null, "window_size": 50, "overlap": 5, "mode": "box_seed", "seed_type": "box", "reprompt": "box_last"}
+}

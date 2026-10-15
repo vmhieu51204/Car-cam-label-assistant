@@ -1,0 +1,24 @@
+// The viewBox trims the source's whitespace without altering or stretching it.
+.cvat-logo-icon.ai-x-logo {
+    width: 96px;
+    min-width: 96px;
+    height: 32px;
+    max-width: 128px;
+    flex-shrink: 0;
+    border-radius: 4px;
+    background: #fff;
+    overflow: hidden;
+
+    > svg {
+        display: block;
+        width: 100%;
+        height: 100%;
+    }
+}
+
+.cvat-signing-header .cvat-logo-icon.ai-x-logo {
+    width: 144px;
+    height: 48px;
+    max-width: 144px;
+    filter: none;
+}

@@ -1,0 +1,8 @@
+{
+  "units": [
+    {"frame_start": 0, "priority": "critical"},
+    {"frame_start": 1, "priority": "high"},
+    {"frame_start": 2, "priority": "normal"},
+    {"frame_start": 3, "priority": "low"}
+  ]
+}

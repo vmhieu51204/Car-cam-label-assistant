@@ -1,0 +1,20 @@
+# torch / torchvision are installed first by setup_wsl.sh / setup_windows.ps1 from the cu128 index:
+#   torch==2.10.0 torchvision==0.25.0  (https://download.pytorch.org/whl/cu128)
+# sam3 itself is installed with --no-deps from git (pinned commit, see samlocal/__init__.py).
+# Below: sam3's runtime dependencies (its pyproject + modules imported on the SAM 3 / SAM 3.1 video path).
+numpy>=1.26,<2
+timm>=1.0.17
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions
+huggingface_hub>=0.30
+tqdm
+psutil
+einops
+scipy
+scikit-image
+pillow
+opencv-python-headless
+# sam3/model_builder.py still imports pkg_resources
+setuptools<81

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoLabel Video Demo</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin: 0; background: #0b1020; color: #e7ecf7; }
+    main { max-width: 1120px; margin: auto; padding: 32px 20px 80px; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    .sub { color: #9eabc4; margin-bottom: 28px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 16px; }
+    section { background: #141b30; border: 1px solid #27314d; border-radius: 14px; padding: 18px; }
+    h2 { margin-top: 0; font-size: 17px; }
+    label { display: block; margin: 12px 0 5px; color: #b9c4da; font-size: 13px; }
+    input, button { box-sizing: border-box; width: 100%; border-radius: 8px; border: 1px solid #394768; padding: 10px 12px; }
+    input { background: #0e1528; color: #fff; }
+    button { margin-top: 10px; background: #3567e8; color: white; border: 0; cursor: pointer; font-weight: 650; }
+    button.secondary { background: #253250; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    a { color: #7da6ff; }
+    code { word-break: break-all; }
+    .status { min-height: 46px; padding: 10px; border-radius: 8px; background: #0e1528; color: #b9c4da; white-space: pre-wrap; }
+    .bar { height: 8px; background: #27314d; border-radius: 6px; overflow: hidden; margin-top: 12px; }
+    .bar > div { height: 100%; width: 0; background: #51d3a5; transition: width .25s; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 9px; border-bottom: 1px solid #27314d; }
+    .pill { padding: 3px 8px; border-radius: 999px; font-weight: 700; }
+    .critical { background: #7c2331; } .high { background: #774d18; }
+    .normal { background: #2d4778; } .low { background: #285e4c; }
+    #queueSection { margin-top: 16px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>AutoLabel Video</h1>
+  <div class="sub">Label frame 0 once. SAM3 propagates, RT-DETR finds late objects, and review priority is computed from the configured signals.</div>
+  <div class="grid">
+    <section>
+      <h2>1 · Upload video</h2>
+      <input id="video" type="file" accept="video/*">
+      <button id="upload">Upload and extract frames</button>
+      <label>Existing job ID</label>
+      <input id="jobId" placeholder="Paste a job UUID to resume">
+      <button id="resume" class="secondary">Resume job</button>
+    </section>
+    <section>
+      <h2>2 · Label frame 0 in CVAT</h2>
+      <label>Labels (comma separated)</label>
+      <input id="labels" value="car,truck,person,bus,bicycle,motorcycle">
+      <button id="createTask" disabled>Create CVAT task</button>
+      <button id="openCvat" class="secondary" disabled>Open CVAT at frame 0</button>
+      <label>CVAT annotation revision</label>
+      <input id="revision" type="number" min="0" value="0">
+      <button id="captureSeed" disabled>Capture frame-0 labels</button>
+    </section>
+    <section>
+      <h2>3 · Run and publish</h2>
+      <button id="propagate" disabled>Run AI labeling</button>
+      <button id="publish" class="secondary" disabled>Publish pending tracks to CVAT</button>
+      <div class="bar"><div id="progress"></div></div>
+      <label>Job status</label>
+      <div id="status" class="status">No job selected.</div>
+    </section>
+  </div>
+  <section id="queueSection">
+    <h2>Review queue</h2>
+    <table>
+      <thead><tr><th>Priority</th><th>Frame</th><th>Tracks</th><th>Reasons</th><th>Open</th></tr></thead>
+      <tbody id="queue"><tr><td colspan="5">Queue will appear when processing finishes.</td></tr></tbody>
+    </table>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const state = { job: null, binding: null, cvatBase: 'http://localhost:8080', timer: null };
+  const api = async (path, options = {}) => {
+    const response = await fetch(path, options);
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try { detail = (await response.json()).detail || detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    return response.json();
+  };
+  const showError = (error) => { $('status').textContent = `Error: ${error.message}`; };
+  const cvatUrl = (frame = 0) => state.binding
+    ? `${state.cvatBase}/tasks/${state.binding.cvat_task_id}/jobs/${state.binding.cvat_job_id}?frame=${frame}` : '#';
+  function renderJob(job) {
+    state.job = job;
+    $('jobId').value = job.job_id;
+    $('status').textContent = `${job.status} · ${job.stage}\n${job.progress_current}/${job.progress_total}`;
+    const percent = job.progress_total ? 100 * job.progress_current / job.progress_total : 0;
+    $('progress').style.width = `${percent}%`;
+    $('createTask').disabled = !['awaiting_seed', 'seed_ready'].includes(job.status);
+    $('captureSeed').disabled = !job.cvat_job_id || !['awaiting_seed', 'seed_ready'].includes(job.status);
+    $('propagate').disabled = job.status !== 'seed_ready';
+    $('publish').disabled = job.status !== 'awaiting_review' || Boolean(job.publish_sha256);
+    if (job.cvat_task_id && job.cvat_job_id) {
+      state.binding = { cvat_task_id: job.cvat_task_id, cvat_job_id: job.cvat_job_id };
+      $('openCvat').disabled = false;
+    }
+    if (job.status === 'awaiting_review') loadQueue().catch(showError);
+    const active = ['queued', 'extracting', 'propagating', 'discovering', 'auditing'].includes(job.status);
+    if (active && !state.timer) state.timer = setInterval(refresh, 1000);
+    if (!active && state.timer) { clearInterval(state.timer); state.timer = null; }
+  }
+  async function refresh() {
+    if (!state.job) return;
+    try { renderJob(await api(`/api/v1/video/jobs/${state.job.job_id}`)); } catch (error) { showError(error); }
+  }
+  async function loadQueue() {
+    const result = await api(`/api/v1/video/jobs/${state.job.job_id}/review-queue`);
+    $('queue').innerHTML = result.units.length ? result.units.map((unit) => `
+      <tr><td><span class="pill ${unit.priority}">${unit.priority}</span></td>
+      <td>${unit.frame_start}${unit.frame_end !== unit.frame_start ? `–${unit.frame_end}` : ''}</td>
+      <td>${unit.track_ids.join(', ') || '—'}</td><td>${unit.reason_codes.join(', ')}</td>
+      <td><a href="${cvatUrl(unit.frame_start)}" target="_blank" rel="noopener">CVAT ↗</a></td></tr>`).join('')
+      : '<tr><td colspan="5">No review units.</td></tr>';
+  }
+  $('upload').onclick = async () => {
+    const file = $('video').files[0];
+    if (!file) return showError(new Error('Choose a video first.'));
+    const body = new FormData(); body.append('file', file);
+    try { renderJob(await api('/api/v1/video/jobs', { method: 'POST', body })); } catch (error) { showError(error); }
+  };
+  $('resume').onclick = async () => {
+    try { renderJob(await api(`/api/v1/video/jobs/${$('jobId').value.trim()}`)); } catch (error) { showError(error); }
+  };
+  $('createTask').onclick = async () => {
+    const labels = $('labels').value.split(',').map((name) => name.trim()).filter(Boolean).map((name) => ({ name }));
+    try {
+      state.binding = await api(`/api/v1/video/jobs/${state.job.job_id}/cvat-task`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ labels })
+      });
+      $('openCvat').disabled = false; await refresh();
+    } catch (error) { showError(error); }
+  };
+  $('openCvat').onclick = () => window.open(cvatUrl(0), '_blank', 'noopener');
+  $('captureSeed').onclick = async () => {
+    try {
+      await api(`/api/v1/video/jobs/${state.job.job_id}/seed`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cvat_job_id: state.binding.cvat_job_id, annotation_revision: Number($('revision').value) })
+      });
+      await refresh();
+    } catch (error) { showError(error); }
+  };
+  $('propagate').onclick = async () => {
+    try { renderJob(await api(`/api/v1/video/jobs/${state.job.job_id}/propagate`, { method: 'POST' })); }
+    catch (error) { showError(error); }
+  };
+  $('publish').onclick = async () => {
+    const value = $('revision').value;
+    try {
+      await api(`/api/v1/video/jobs/${state.job.job_id}/publish`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_annotation_revision: value === '' ? null : Number(value) })
+      });
+      await refresh(); window.open(cvatUrl(0), '_blank', 'noopener');
+    } catch (error) { showError(error); }
+  };
+  api('/api/v1/demo/config').then((config) => { state.cvatBase = config.cvat_public_url; }).catch(() => {});
+</script>
+</body>
+</html>

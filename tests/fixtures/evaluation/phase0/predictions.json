@@ -1,0 +1,9 @@
+{
+  "predictions": [
+    {"video_id": "synthetic", "frame": 0, "track_id": "a", "class": "car", "box": [10, 10, 50, 50]},
+    {"video_id": "synthetic", "frame": 1, "track_id": "a", "class": "car", "box": [12, 10, 52, 50]},
+    {"video_id": "synthetic", "frame": 2, "track_id": "a", "class": "car", "box": [14, 10, 54, 50]},
+    {"video_id": "synthetic", "frame": 4, "track_id": "b", "class": "car", "box": [18, 10, 58, 50]},
+    {"video_id": "synthetic", "frame": 5, "track_id": "noise", "class": "car", "box": [100, 10, 140, 50]}
+  ]
+}

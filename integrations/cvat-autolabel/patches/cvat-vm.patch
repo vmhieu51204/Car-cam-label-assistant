@@ -1,0 +1,1208 @@
+diff --git a/cvat/apps/engine/models.py b/cvat/apps/engine/models.py
+--- a/cvat/apps/engine/models.py
++++ b/cvat/apps/engine/models.py
+@@ -1867,3 +1867,19 @@
+     ANNOTATIONS = "annotations"
+     DATASET = "dataset"
+     BACKUP = "backup"
++
++
++# AutoLabel progressive state: additive, retained after inference for safe user saves.
++class AutoLabelStreamState(models.Model):
++    job = models.OneToOneField(Job, primary_key=True, on_delete=models.CASCADE)
++    state = models.JSONField(default=dict)
++
++
++class AutoLabelStreamOperation(models.Model):
++    job = models.ForeignKey(Job, on_delete=models.CASCADE)
++    operation_id = models.CharField(max_length=200)
++    digest = models.CharField(max_length=64)
++    result = models.JSONField(default=dict)
++
++    class Meta:
++        unique_together = (("job", "operation_id"),)
+diff --git a/cvat/apps/engine/permissions.py b/cvat/apps/engine/permissions.py
+--- a/cvat/apps/engine/permissions.py
++++ b/cvat/apps/engine/permissions.py
+@@ -1006,6 +1006,8 @@
+             ("create", "POST"): Scopes.CREATE,
+             ("retrieve", "GET"): Scopes.VIEW,
+             ("autolabel_permission", "GET"): Scopes.UPDATE_ANNOTATIONS,
++            ("autolabel_stream", "GET"): Scopes.VIEW_ANNOTATIONS,
++            ("autolabel_stream", "POST"): Scopes.UPDATE_ANNOTATIONS,
+             ("partial_update", "PATCH"): Scopes.UPDATE,
+             ("destroy", "DELETE"): Scopes.DELETE,
+             ("annotations", "GET"): Scopes.VIEW_ANNOTATIONS,
+diff --git a/cvat/apps/engine/views.py b/cvat/apps/engine/views.py
+--- a/cvat/apps/engine/views.py
++++ b/cvat/apps/engine/views.py
+@@ -1795,6 +1795,8 @@
+     )
+     def annotations(self, request: ExtendedRequest, pk: int):
+         self._object = self.get_object()  # force call of check_object_permissions()
++        if request.method not in ("GET", "OPTIONS") and models.AutoLabelStreamState.objects.filter(job__segment__task_id=pk).exists():
++            return Response({"detail":"Use progressive job Save"}, status=409)
+         if request.method == "GET":
+             if not self._object.data:
+                 return HttpResponseBadRequest(
+@@ -2312,6 +2314,58 @@
+         self.get_object()  # Enforce the same OPA scope as updating job annotations.
+         return Response({"allowed": True})
+ 
++    @action(detail=True, methods=["GET", "POST"], url_path="autolabel-stream")
++    def autolabel_stream(self, request: ExtendedRequest, pk: int):
++        self.get_object()
++        if request.method == "GET":
++            return Response({"enabled": models.AutoLabelStreamState.objects.filter(job_id=pk).exists()})
++        from cvat.apps.engine.autolabel_stream import handle_stream
++        mode = request.data.get("mode")
++        if mode not in ("incremental", "save"):
++            return Response({"detail":"Invalid progressive operation"}, status=400)
++        if mode == "incremental":
++            data = request.data
++            operations = data.get("operations")
++            if (type(data.get("expected_revision")) is not int or
++                not isinstance(data.get("operation_id"), str) or not 1 <= len(data["operation_id"]) <= 200 or
++                not isinstance(operations, list) or len(operations) > 10000):
++                return Response({"detail":"Invalid progressive batch"}, status=400)
++            for operation in operations:
++                if (not isinstance(operation, dict) or type(operation.get("frame")) is not int or
++                    type(operation.get("total_frames")) is not int or
++                    not 0 <= operation["frame"] < operation["total_frames"] or
++                    not isinstance(operation.get("identity"), str) or
++                    not isinstance(operation.get("attributes"), list) or
++                    not any(a.get("value") == operation["identity"] for a in operation["attributes"])):
++                    return Response({"detail":"Invalid progressive frame"}, status=400)
++                serializer = LabeledDataSerializer(data={"tracks":[{
++                    "frame":operation["frame"],"label_id":operation.get("label_id"),
++                    "attributes":operation["attributes"],"shapes":[{
++                        "frame":operation["frame"],"type":"rectangle","points":operation.get("points")
++                    }]}]})
++                serializer.is_valid(raise_exception=True)
++        else:
++            if not isinstance(request.data.get("operation_id"),str) or not 1<=len(request.data["operation_id"])<=200:
++                return Response({"detail":"Save operation identity required"},status=400)
++            choices=request.data.get("choices",{})
++            if not isinstance(choices,dict) or len(choices)>100 or any(v not in ("local","remote") for v in choices.values()):
++                return Response({"detail":"Invalid conflict choices"},status=400)
++            for key in ("base", "local"):
++                serializer = LabeledDataSerializer(data=request.data.get(key))
++                serializer.is_valid(raise_exception=True)
++        def patch_progressive_annotations(job_id, data, action):
++            serializer = LabeledDataSerializer(data=data, context={"annotation_action": action})
++            serializer.is_valid(raise_exception=True)
++            return dm.task.patch_job_data(job_id, serializer.validated_data, action)
++        try:
++            code, payload = handle_stream(job_id=pk, data=request.data, mode=mode,
++                transaction=transaction, job_model=models.Job, get_annotations=dm.task.get_job_data,
++                patch_annotations=patch_progressive_annotations, put_annotations=dm.task.put_job_data)
++        except (KeyError, TypeError, ValueError):
++            return Response({"detail":"Invalid progressive annotation"}, status=400)
++        return Response(payload, status=code)
++
++
+     @transaction.atomic
+     def perform_create(self, serializer):
+         super().perform_create(serializer)
+@@ -2522,6 +2572,9 @@
+     )
+     def annotations(self, request: ExtendedRequest, pk: int):
+         self._object: models.Job = self.get_object()  # force call of check_object_permissions()
++        if request.method not in ("GET", "OPTIONS") and models.AutoLabelStreamState.objects.filter(job_id=pk).exists():
++            if not (request.method == "PATCH" and request.query_params.get("action") == "create" and request.headers.get("X-Autolabel-Proposal-Id") and request.headers.get("X-Autolabel-Expected-Revision")):
++                return Response({"detail":"Use progressive Save to preserve newly processed frames"}, status=409)
+         if request.method == "GET":
+             if {
+                 "format",
+diff --git a/cvat-core/src/annotations-saver.ts b/cvat-core/src/annotations-saver.ts
+--- a/cvat-core/src/annotations-saver.ts
++++ b/cvat-core/src/annotations-saver.ts
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: MIT
+ 
+ import _ from 'lodash';
++import { reconcileAfterSave } from './autolabel-merge';
+ import serverProxy, { sleep } from './server-proxy';
+ import { Job, Task } from './session';
+ import { DataError, ServerError } from './exceptions';
+@@ -216,6 +217,7 @@
+     private id: number;
+     private collection: any;
+     private hash: string;
++    private progressiveIntent: any = null;
+     private initialObjects: {
+         shapes: Map<number, SerializedCollection['shapes'][0]>,
+         tracks: Map<number, SerializedCollection['tracks'][0]>,
+@@ -383,6 +385,75 @@
+     }
+ 
+     async save(onUpdateArg?: (message: string) => void): Promise<void> {
++        // Progressive VM jobs use a three-way save; native whole-track updates can lose new frames.
++        if (this.sessionType === 'job' && typeof window !== 'undefined') {
++            const probe = await fetch(`/api/jobs/${this.id}/autolabel-stream`, { credentials: 'same-origin' });
++            if (probe.ok && (await probe.json()).enabled) {
++                const base = Object.fromEntries(COLLECTION_KEYS.map((key) => [
++                    key, [...this.initialObjects[key].values()],
++                ]));
++                const csrf = document.cookie.split('; ').find((item) => item.startsWith('csrftoken='))?.split('=')[1];
++                if (!this.progressiveIntent) this.progressiveIntent = {
++                    operation_id: `save:${Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, '0')).join('')}`, base, local: this.collection.export(),
++                };
++                const intent = this.progressiveIntent;
++                const local = intent.local;
++                let choices = {};
++                let expectedRevision = null;
++                let payload;
++                for (;;) {
++                const response = await fetch(`/api/jobs/${this.id}/autolabel-stream`, {
++                    method: 'POST', credentials: 'same-origin',
++                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': decodeURIComponent(csrf || '') },
++                    body: JSON.stringify({ mode: 'save', ...intent, choices, expected_revision: expectedRevision }),
++                });
++                payload = await response.json();
++                if (response.status === 409 && payload.conflict) {
++                    if (payload.conflict === 'revision') choices = {};
++                    else {
++                        const choice = await new Promise<string>((resolve) => {
++                            const timeout = window.setTimeout(() => resolve('cancel'), 120000);
++                            window.dispatchEvent(new CustomEvent('autolabel:save-conflict', { detail: {
++                                path: payload.conflict, local, remote: payload.current,
++                                choose: (value: string) => { window.clearTimeout(timeout); resolve(value); },
++                            } }));
++                        });
++                        if (!['local', 'remote'].includes(choice)) {
++                            this.progressiveIntent = null;
++                            throw new ServerError('Save cancelled; local edits are retained', 409);
++                        }
++                        choices = { ...choices, [payload.conflict]: choice };
++                    }
++                    expectedRevision = payload.revision;
++                    continue;
++                }
++                if (!response.ok) {
++                    throw new ServerError(`Progressive save conflict: ${payload.conflict || payload.detail}`, response.status);
++                }
++                break;
++                }
++                const current = this.collection.export();
++                const changedDuringSave = JSON.stringify(current) !== JSON.stringify(local);
++                const combined = reconcileAfterSave(local, current, payload.annotations, payload.created_ids);
++                window.dispatchEvent(new CustomEvent('autolabel:save-before', { detail: { createdIDs: payload.created_ids } }));
++                this.collection.clear();
++                this.collection.import(combined);
++                this.collection.flush = false;
++                for (const key of COLLECTION_KEYS) {
++                    this.initialObjects[key].clear();
++                    for (const object of payload.annotations[key]) {
++                        this.initialObjects[key].set(object.id, object as any);
++                    }
++                }
++                this.hash = changedDuringSave ? '' : this._getHash();
++                this.progressiveIntent = null;
++                window.dispatchEvent(new CustomEvent('autolabel:save-after'));
++                return;
++            }
++            if (!probe.ok && probe.status !== 404) {
++                throw new ServerError('Could not verify progressive annotation state', probe.status);
++            }
++        }
+         const onUpdate = typeof onUpdateArg === 'function' ? onUpdateArg : (message) => {
+             console.log(message);
+         };
+diff --git a/cvat-core/src/session.ts b/cvat-core/src/session.ts
+--- a/cvat-core/src/session.ts
++++ b/cvat-core/src/session.ts
+@@ -339,11 +339,11 @@
+                     );
+                     return result;
+                 },
+-                async contextImage(frameId) {
++                async contextImage(frameId, signal) {
+                     const result = await PluginRegistry.apiWrapper.call(
+                         this,
+                         prototype.frames.contextImage,
+-                        frameId,
++                        frameId, signal,
+                     );
+                     return result;
+                 },
+@@ -449,6 +449,7 @@
+         removeBatch: (objectStates: ObjectState[], force?: boolean) => Promise<number[]>;
+         clear: (options?: {
+             reload?: boolean;
++            preserveUnsaved?: boolean;
+             from?: number;
+             to?: number;
+             delTrackKeyframesOnly?: boolean;
+@@ -531,7 +532,7 @@
+         cachedChunks: () => Promise<number[]>;
+         frameNumbers: () => Promise<number[]>;
+         preview: () => Promise<string>;
+-        contextImage: (frame: number) => Promise<Record<string, ImageBitmap>>;
++        contextImage: (frame: number, signal?: AbortSignal) => Promise<Record<string, ImageBitmap>>;
+         contextImageData: (frame: number) => Promise<ArrayBuffer>;
+         search: (
+             filters: {
+diff --git a/cvat-core/src/annotations.ts b/cvat-core/src/annotations.ts
+--- a/cvat-core/src/annotations.ts
++++ b/cvat-core/src/annotations.ts
+@@ -180,6 +180,22 @@
+         checkObjectType('reload', reload, 'boolean');
+ 
+         if (reload) {
++            if (options.preserveUnsaved) {
++                const previous = cache.collection.get(session);
++                if (!previous || previous.saver.hasUnsavedChanges()) {
++                    throw new ArgumentError('Save local edits before synchronizing');
++                }
++                const data = await serverProxy.annotations.getAnnotations(sessionType, session.id);
++                if (previous !== cache.collection.get(session) || previous.saver.hasUnsavedChanges()) {
++                    throw new ArgumentError('New local edits retained; synchronization postponed');
++                }
++                // No await between the final dirty check and replacement.
++                previous.collection.clear();
++                previous.collection.import(data);
++                cache.history.get(session)?.clear();
++                cache.collection.set(session, { collection: previous.collection, saver: new AnnotationsSaver(previous.collection, session) });
++                return;
++            }
+             cache.collection.delete(session);
+             // delete history as it may relate to objects from collection we deleted above
+             cache.history.delete(session);
+diff --git a/cvat-ui/src/components/annotation-page/annotation-page.tsx b/cvat-ui/src/components/annotation-page/annotation-page.tsx
+--- a/cvat-ui/src/components/annotation-page/annotation-page.tsx
++++ b/cvat-ui/src/components/annotation-page/annotation-page.tsx
+@@ -4,6 +4,9 @@
+ // SPDX-License-Identifier: MIT
+ 
+ import React, { useEffect } from 'react';
++import { useDispatch, useStore } from 'react-redux';
++import { CombinedState } from 'reducers';
++import { installAutoLabelBridge } from 'utils/autolabel-vm-bridge';
+ import Layout from 'antd/lib/layout';
+ import Spin from 'antd/lib/spin';
+ import notification from 'antd/lib/notification';
+@@ -47,6 +50,12 @@
+         job, fetching, annotationsInitialized, workspace, frameNumber,
+         getJob, closeJob, saveLogs, changeFrame,
+     } = props;
++    const progressiveDispatch = useDispatch();
++    const progressiveStore = useStore<CombinedState>();
++    useEffect(() => {
++        if (!job) return undefined;
++        return installAutoLabelBridge(job, changeFrame, progressiveDispatch, progressiveStore.getState);
++    }, [job, changeFrame]);
+     const prevJob = usePrevious(job);
+     const prevFetching = usePrevious(fetching);
+ 
+diff --git a/cvat-ui/src/components/header/settings-modal/settings-modal.tsx b/cvat-ui/src/components/header/settings-modal/settings-modal.tsx
+--- a/cvat-ui/src/components/header/settings-modal/settings-modal.tsx
++++ b/cvat-ui/src/components/header/settings-modal/settings-modal.tsx
+@@ -11,6 +11,7 @@
+ import Text from 'antd/lib/typography/Text';
+ import Modal from 'antd/lib/modal/Modal';
+ import Button from 'antd/lib/button';
++import LowMemory3DSettings from './low-memory3d-settings';
+ import notification from 'antd/lib/notification';
+ import { PlayCircleOutlined, LaptopOutlined, BuildOutlined } from '@ant-design/icons';
+ 
+@@ -55,6 +56,12 @@
+     }, []);
+ 
+     const tabItems = [
++        { key: '3d-memory', label: <Text>3D Ã­t RAM</Text>, children: <LowMemory3DSettings /> },
++        { key: 'vlm', label: <Text>VLM</Text>, children: (
++            <Button onClick={() => window.dispatchEvent(new CustomEvent('autolabel:vlm-settings'))}>
++                Configure private vision API
++            </Button>
++        ) },
+         {
+             key: 'player',
+             label: <Text>Player</Text>,
+diff --git a/cvat-data/src/ts/cvat-data.ts b/cvat-data/src/ts/cvat-data.ts
+--- a/cvat-data/src/ts/cvat-data.ts
++++ b/cvat-data/src/ts/cvat-data.ts
+@@ -439,3 +439,6 @@
+         ).sort((a, b) => a - b);
+     }
+ }
++
++export { LowMemory3DFrames, Stale3DRequest } from './low-memory3d';
++export { Context3DCache } from './context3d';
+diff --git a/cvat-core/src/config.ts b/cvat-core/src/config.ts
+--- a/cvat-core/src/config.ts
++++ b/cvat-core/src/config.ts
+@@ -5,6 +5,10 @@
+ 
+ const config = {
+     backendAPI: '/api',
++    lowMemory3D: (() => {
++        try { return typeof localStorage !== 'undefined' && localStorage.getItem('cvat.3d.low-memory') === 'true'; }
++        catch { return false; }
++    })(),
+     organization: {
+         organizationID: null,
+         organizationSlug: null,
+diff --git a/cvat-core/src/index.ts b/cvat-core/src/index.ts
+--- a/cvat-core/src/index.ts
++++ b/cvat-core/src/index.ts
+@@ -231,6 +231,7 @@
+         onOrganizationChange: (newOrgId: number | null) => void | null;
+         globalObjectsCounter: typeof config.globalObjectsCounter;
+         requestsStatusDelay: typeof config.requestsStatusDelay;
++        lowMemory3D: boolean;
+         jobMetaDataReloadPeriod: typeof config.jobMetaDataReloadPeriod;
+         previewPlaceholders: typeof config.previewPlaceholders;
+     },
+diff --git a/cvat-core/src/api.ts b/cvat-core/src/api.ts
+--- a/cvat-core/src/api.ts
++++ b/cvat-core/src/api.ts
+@@ -344,6 +344,8 @@
+             set requestsStatusDelay(value) {
+                 config.requestsStatusDelay = value;
+             },
++            get lowMemory3D() { return config.lowMemory3D; },
++            set lowMemory3D(value: boolean) { config.lowMemory3D = !!value; },
+             get jobMetaDataReloadPeriod() {
+                 return config.jobMetaDataReloadPeriod;
+             },
+diff --git a/cvat-core/src/server-proxy.ts b/cvat-core/src/server-proxy.ts
+--- a/cvat-core/src/server-proxy.ts
++++ b/cvat-core/src/server-proxy.ts
+@@ -1743,8 +1743,14 @@
+     }
+ }
+ 
+-async function getData(jid: number, chunk: number, quality: ChunkQuality): Promise<ArrayBuffer> {
+-    const { backendAPI } = config;
++async function getData(jid: number, chunk: number, quality: ChunkQuality, signal?: AbortSignal): Promise<ArrayBuffer> {
++    const { backendAPI } = config;
++    if (signal) {
++        const params = new URLSearchParams({ ...enableOrganization(), quality, type: 'chunk', index: String(chunk) });
++        const response = await fetch(`${backendAPI}/jobs/${jid}/data?${params}`, { signal, credentials: 'include' });
++        if (!response.ok) throw new Error(`3D chunk download HTTP ${response.status}`);
++        return response.arrayBuffer();
++    }
+     const pageWasVisible = isPageVisible();
+     const pageVisibilityVersionAtStart = pageVisibilityCounter;
+ 
+diff --git a/cvat-core/src/frames.ts b/cvat-core/src/frames.ts
+--- a/cvat-core/src/frames.ts
++++ b/cvat-core/src/frames.ts
+@@ -5,7 +5,7 @@
+ 
+ import _, { range, sortedIndexOf } from 'lodash';
+ import {
+-    FrameDecoder, BlockType, DimensionType, ChunkQuality, decodeContextImages, RequestOutdatedError,
++    Context3DCache, Stale3DRequest, LowMemory3DFrames, FrameDecoder, BlockType, DimensionType, ChunkQuality, decodeContextImages, RequestOutdatedError,
+ } from 'cvat-data';
+ import PluginRegistry from './plugins';
+ import { MediaType } from './enums';
+@@ -15,10 +15,14 @@
+ import { FieldUpdateTrigger } from './common';
+ import config from './config';
+ 
++const bounded3DFrames: Record<number, LowMemory3DFrames> = {};
++const boundedContext: Record<number, Context3DCache> = {};
++
+ // frame storage by job id
+ const frameDataCache: Record<string, {
+     metaFetchedTimestamp: number;
+     chunkSize: number;
++    dimension: DimensionType;
+     mode: 'annotation' | 'interpolation';
+     jobStartFrame: number;
+     decodeForward: boolean;
+@@ -396,7 +400,14 @@
+         renderHeight: number;
+         imageData: ImageBitmap | Blob;
+     }> {
++        const started = performance.now();
+         const result = await PluginRegistry.apiWrapper.call(this, FrameData.prototype.data, onServerRequest);
++        if (frameDataCache[this.jobID]?.dimension === DimensionType.DIMENSION_3D) {
++            window.dispatchEvent(new CustomEvent('cvat:3d-performance', { detail: {
++                stage: 'frame-ready', frame: this.number, job: this.jobID, low_memory: config.lowMemory3D,
++                total_ms: performance.now() - started,
++            } }));
++        }
+         return result;
+     }
+ }
+@@ -462,6 +473,37 @@
+             decodeForward, forwardStep, decodedBlocksCacheSize, segmentFrameNumbers,
+         } = frameDataCache[this.jobID];
+         const meta = await frameDataCache[this.jobID].getMeta();
++        if (frameDataCache[this.jobID].dimension === DimensionType.DIMENSION_3D && config.lowMemory3D) {
++            provider.cleanup(Number.MAX_SAFE_INTEGER);
++            if (!bounded3DFrames[this.jobID]) {
++                bounded3DFrames[this.jobID] = new LowMemory3DFrames(
++                    (index, signal) => serverProxy.frames.getData(this.jobID, index, ChunkQuality.COMPRESSED, signal),
++                    (number) => {
++                        const index = meta.getFrameChunkIndex(meta.getDataFrameNumber(number - jobStartFrame));
++                        return { index, frames: segmentFrameNumbers.slice(index * chunkSize, (index + 1) * chunkSize) };
++                    }, undefined,
++                    (detail) => window.dispatchEvent(new CustomEvent('cvat:3d-performance', { detail })),
++                );
++            }
++            const offset = segmentFrameNumbers.indexOf(this.number);
++            if (offset < 0) throw new Error('3D source frame mapping differs');
++            // Buffer eight source frames, respecting playback direction/step and sparse jobs.
++            const direction = forwardStep < 0 ? -1 : 1;
++            const distance = Math.max(1, Math.abs(forwardStep));
++            const next = segmentFrameNumbers.filter((number) => direction > 0 ?
++                number >= this.number + distance : number <= this.number - distance);
++            if (direction < 0) next.reverse();
++            next.splice(8);
++            if (!bounded3DFrames[this.jobID].cache.get(this.number)) onServerRequest();
++            let imageData: Blob;
++            try { imageData = await bounded3DFrames[this.jobID].load(this.number, next); }
++            catch (error) {
++                if (error instanceof Stale3DRequest || error?.name === 'AbortError') throw this.number;
++                throw error;
++            }
++            return { renderWidth: this.width, renderHeight: this.height, imageData };
++        }
++        if (bounded3DFrames[this.jobID]) { bounded3DFrames[this.jobID].close(); delete bounded3DFrames[this.jobID]; }
+ 
+         return new Promise<{
+             renderWidth: number;
+@@ -472,6 +514,15 @@
+             const requestedDataFrameNumber = meta.getDataFrameNumber(this.number - jobStartFrame);
+             const chunkIndex = meta.getFrameChunkIndex(requestedDataFrameNumber);
+             const frame = provider.frame(this.number);
++            frameDataCache[this.jobID].latestFrameDecodeRequest = requestId;
++            const continuePreloading = (): void => {
++                // Re-enter only the cached-frame path after releasing the decoder.
++                // A seek/job close invalidates this continuation.
++                queueMicrotask(() => {
++                    if (frameDataCache[this.jobID]?.latestFrameDecodeRequest === requestId &&
++                        provider.frame(this.number)) void this.data().catch(() => {});
++                });
++            };
+ 
+             function findTheNextNotDecodedChunk(currentFrameIndex: number): number | null {
+                 const { chunkCount } = meta;
+@@ -495,23 +546,25 @@
+ 
+             if (frame) {
+                 if (
+-                    prefetchAnalyzer.shouldPrefetchNext(
+-                        this.number,
+-                        decodeForward,
+-                        (chunk) => provider.isChunkCached(chunk),
+-                    ) && decodedBlocksCacheSize > 1 && !frameDataCache[this.jobID].activeChunkRequest
++                    decodedBlocksCacheSize > 1 && !frameDataCache[this.jobID].activeChunkRequest
+                 ) {
+                     const nextChunkIndex = findTheNextNotDecodedChunk(
+                         meta.getFrameIndex(requestedDataFrameNumber),
+                     );
+-                    const predecodeChunksMax = Math.floor(decodedBlocksCacheSize / 2);
++                    const predecodeChunksMax = Math.min(2, decodedBlocksCacheSize - 1);
+                     if (nextChunkIndex !== null &&
+-                        nextChunkIndex <= chunkIndex + predecodeChunksMax
++                        Math.abs(nextChunkIndex - chunkIndex) <= predecodeChunksMax
+                     ) {
+                         frameDataCache[this.jobID].activeChunkRequest = new Promise((resolveForward) => {
+                             const releasePromise = (): void => {
+                                 resolveForward();
+-                                frameDataCache[this.jobID].activeChunkRequest = null;
++                                if (frameDataCache[this.jobID]) {
++                                    frameDataCache[this.jobID].activeChunkRequest = null;
++                                }
++                            };
++                            const completePreload = (): void => {
++                                releasePromise();
++                                continuePreloading();
+                             };
+ 
+                             frameDataCache[this.jobID].getChunk(
+@@ -533,7 +586,7 @@
+                                         (nextChunkIndex + 1) * chunkSize,
+                                     ),
+                                     () => {},
+-                                    releasePromise,
++                                    completePreload,
+                                     releasePromise,
+                                 );
+                             }).catch(() => {
+@@ -570,6 +623,7 @@
+                         imageData: currentFrame,
+                     });
+                     prefetchAnalyzer.addRequested(this.number);
++                    continuePreloading();
+                     return;
+                 }
+ 
+@@ -577,9 +631,11 @@
+                     resolveLoadAndDecode,
+                 ) => {
+                     let wasResolved = false;
++                    const networkStarted = performance.now();
+                     frameDataCache[this.jobID].getChunk(
+                         chunkIndex, ChunkQuality.COMPRESSED,
+                     ).then((chunk: ArrayBuffer) => {
++                        const decodeStarted = performance.now();
+                         try {
+                             if (!(this.jobID in frameDataCache)) {
+                                 // check if frameDataCache still exist
+@@ -616,9 +672,16 @@
+                                         }
+                                     },
+                                     () => {
++                                        if (frameDataCache[this.jobID]?.dimension === DimensionType.DIMENSION_3D) {
++                                            window.dispatchEvent(new CustomEvent('cvat:3d-performance', { detail: {
++                                                stage: 'download-decode', frame: this.number, job: this.jobID, low_memory: false,
++                                                network_ms: decodeStarted - networkStarted, decode_ms: performance.now() - decodeStarted,
++                                            } }));
++                                        }
+                                         frameDataCache[this.jobID].activeChunkRequest = null;
+                                         resolveLoadAndDecode();
+                                         const decodedFrame = provider.frame(this.number);
++                                        continuePreloading();
+                                         if (decodeForward) {
+                                             // resolve after decoding everything if playing
+                                             resolve({
+@@ -644,8 +707,9 @@
+                             reject(error);
+                         }
+                     }).catch((error) => {
++                        if (frameDataCache[this.jobID]) frameDataCache[this.jobID].activeChunkRequest = null;
+                         reject(error);
+-                        resolveLoadAndDecode(error);
++                        resolveLoadAndDecode();
+                     });
+                 });
+             });
+@@ -770,6 +834,8 @@
+             // chunks were re-defined. Existing data not relevant anymore
+             // currently we only re-write meta, remove all cached frames from provider and clear cached context images
+             // other parameters (e.g. chunkSize) are not supposed to be changed
++            bounded3DFrames[jobID]?.close(); delete bounded3DFrames[jobID];
++            boundedContext[jobID]?.close(); delete boundedContext[jobID];
+             cached.provider.cleanup(Number.MAX_SAFE_INTEGER);
+             for (const frame of Object.keys(cached.contextCache)) {
+                 for (const image of Object.values(cached.contextCache[+frame].data)) {
+@@ -788,6 +854,7 @@
+     jobID: number,
+     frame: number,
+     getImageContext: (frame: number) => Promise<ArrayBuffer>,
++    signal?: AbortSignal,
+ ): Promise<Record<string, ImageBitmap>> {
+     if (!(jobID in frameDataCache)) {
+         throw new Error(
+@@ -802,6 +869,15 @@
+     const dataFrameNumber = meta.getDataFrameNumber(frame - jobStartFrame);
+     const frameIndex = meta.getFrameIndex(dataFrameNumber);
+     const { related_files: relatedFiles } = meta.frames[frameIndex];
++    if (config.lowMemory3D && frameData.dimension === DimensionType.DIMENSION_3D) {
++        // Legacy cached originals can still be held by viewports from before the
++        // transition. Drop our references without closing consumer-owned images.
++        frameData.contextCache = {};
++        boundedContext[jobID] ??= new Context3DCache();
++        return boundedContext[jobID].load(frame, async () => relatedFiles ?
++            decodeContextImages(await getImageContext(frame), 0, relatedFiles) : {}, signal);
++    }
++    boundedContext[jobID]?.close(); delete boundedContext[jobID];
+     return new Promise<Record<string, ImageBitmap>>((resolve, reject) => {
+         if (relatedFiles === 0) {
+             resolve({});
+@@ -931,6 +1007,7 @@
+ 
+         frameDataCache[jobID] = {
+             metaFetchedTimestamp: Date.now(),
++            dimension,
+             chunkSize,
+             mode,
+             jobStartFrame,
+@@ -1085,6 +1162,8 @@
+ }
+ 
+ export function clear(jobID: number): void {
++    bounded3DFrames[jobID]?.close(); delete bounded3DFrames[jobID];
++    boundedContext[jobID]?.close(); delete boundedContext[jobID];
+     if (jobID in frameDataCache) {
+         frameDataCache[jobID].provider.close();
+         for (const contextImagesByFrame of Object.values(frameDataCache[jobID].contextCache)) {
+diff --git a/cvat-core/src/session-implementation.ts b/cvat-core/src/session-implementation.ts
+--- a/cvat-core/src/session-implementation.ts
++++ b/cvat-core/src/session-implementation.ts
+@@ -297,8 +297,9 @@
+         value: function contextImageImplementation(
+             this: JobClass,
+             frameId: Parameters<typeof JobClass.prototype.frames.contextImage>[0],
++            signal?: AbortSignal,
+         ): ReturnType<typeof JobClass.prototype.frames.contextImage> {
+-            return getContextImage(this.id, frameId, (frame) => this.frames.contextImageData(frame));
++            return getContextImage(this.id, frameId, (frame) => this.frames.contextImageData(frame), signal);
+         },
+     });
+ 
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx
+--- a/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx
++++ b/cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx
+@@ -4,13 +4,14 @@
+ // SPDX-License-Identifier: MIT
+ 
+ import './styles.scss';
++import LowMemory3DControls from './low-memory3d-controls';
+ import React, { useCallback, useEffect, useRef } from 'react';
+ import { connect, useDispatch, useSelector } from 'react-redux';
+ import {
+     ArrowDownOutlined, ArrowLeftOutlined, ArrowRightOutlined, ArrowUpOutlined,
+ } from '@ant-design/icons';
+ import Button from 'antd/lib/button';
+-import Spin from 'antd/lib/spin';
++import PlaybackLoading from '../../playback-loading';
+ 
+ import {
+     activateObject,
+@@ -280,11 +281,7 @@
+ 
+ type Props = StateToProps & DispatchToProps;
+ 
+-const Spinner = React.memo(() => (
+-    <div className='cvat-spinner-container'>
+-        <Spin className='cvat-spinner' />
+-    </div>
+-));
++const Spinner = React.memo(PlaybackLoading);
+ 
+ export const PerspectiveViewComponent = React.memo(
+     (): JSX.Element => {
+@@ -494,7 +491,8 @@
+                     className='cvat-canvas-container cvat-canvas-container-overflow'
+                     ref={ref}
+                 />
+-                <GlobalHotKeys handlers={handlers} keyMap={subKeyMap(componentShortcuts, keyMap)} />
++                <LowMemory3DControls />
++            <GlobalHotKeys handlers={handlers} keyMap={subKeyMap(componentShortcuts, keyMap)} />
+                 <ArrowGroup />
+                 <ControlGroup />
+             </div>
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx b/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx
+--- a/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx
++++ b/cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx
+@@ -15,6 +15,7 @@
+ import CVATTooltop from 'components/common/cvat-tooltip';
+ import { CombinedState } from 'reducers';
+ import ContextImageSelector from './context-image-selector';
++import { releaseContextCopies } from 'utils/low-memory3d-profile';
+ 
+ interface Props {
+     offset: number[];
+@@ -48,9 +49,13 @@
+ 
+     useEffect(() => {
+         let unmounted = false;
+-        const promise = job.frames.contextImage(frameIndex);
++        let owned: Record<string, ImageBitmap> = {};
++        const controller = new AbortController();
++        const promise = job.frames.contextImage(frameIndex, controller.signal);
+         setFetching(true);
+         promise.then((imageBitmaps: Record<string, ImageBitmap>) => {
++            owned = imageBitmaps;
++            if (unmounted) releaseContextCopies(owned);
+             if (!unmounted) {
+                 setContextImageData(imageBitmaps);
+             }
+@@ -71,6 +76,8 @@
+         return () => {
+             setContextImageData({});
+             unmounted = true;
++            controller.abort();
++            releaseContextCopies(owned);
+         };
+     }, [frameIndex]);
+ 
+diff --git a/cvat-canvas3d/src/typescript/canvas3dModel.ts b/cvat-canvas3d/src/typescript/canvas3dModel.ts
+--- a/cvat-canvas3d/src/typescript/canvas3dModel.ts
++++ b/cvat-canvas3d/src/typescript/canvas3dModel.ts
+@@ -74,6 +74,8 @@
+ }
+ 
+ export interface Configuration {
++    lowMemory3D: boolean;
++    detailedObject: boolean;
+     colorBy: string;
+     shapeOpacity: number;
+     outlinedBorders: string | false;
+@@ -194,6 +196,7 @@
+                 enabled: false,
+             },
+             configuration: {
++                lowMemory3D: false, detailedObject: false,
+                 colorBy: 'Label',
+                 shapeOpacity: 40,
+                 outlinedBorders: false,
+@@ -402,6 +405,8 @@
+     }
+ 
+     public configure(configuration: Partial<Configuration>): void {
++        if (typeof configuration.lowMemory3D === 'boolean') this.data.configuration.lowMemory3D = configuration.lowMemory3D;
++        if (typeof configuration.detailedObject === 'boolean') this.data.configuration.detailedObject = configuration.detailedObject;
+         if (typeof configuration.shapeOpacity === 'number') {
+             this.data.configuration.shapeOpacity = Math.max(0, Math.min(configuration.shapeOpacity, 100));
+         }
+diff --git a/cvat-canvas3d/src/typescript/canvas3d.ts b/cvat-canvas3d/src/typescript/canvas3d.ts
+--- a/cvat-canvas3d/src/typescript/canvas3d.ts
++++ b/cvat-canvas3d/src/typescript/canvas3d.ts
+@@ -123,7 +123,9 @@
+     }
+ 
+     public destroy(): void {
++        this.view.destroy();
+         this.model.destroy();
++        this.model.unsubscribeAll();
+     }
+ }
+ 
+diff --git a/cvat-canvas3d/src/typescript/canvas3dView.ts b/cvat-canvas3d/src/typescript/canvas3dView.ts
+--- a/cvat-canvas3d/src/typescript/canvas3dView.ts
++++ b/cvat-canvas3d/src/typescript/canvas3dView.ts
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: MIT
+ 
+ import * as THREE from 'three';
++import { CloudRequest } from './pointcloud-client';
+ import { PCDLoader } from 'three/examples/jsm/loaders/PCDLoader';
+ import CameraControls from 'camera-controls';
+ import { Canvas3dController } from './canvas3dController';
+@@ -23,6 +24,7 @@
+ export interface Canvas3dView {
+     html(): ViewsDOM;
+     render(): void;
++    destroy(): void;
+     keyControls(keys: KeyboardEvent): void;
+     focusObjectByClientId(clientID: number, animate?: boolean): void;
+ }
+@@ -162,7 +164,7 @@
+     private get selectedCuboid(): CuboidModel | null {
+         const { clientID } = this.model.data.activeElement;
+         if (clientID !== null) {
+-            return this.drawnObjects[+clientID].cuboid || null;
++            return this.drawnObjects[+clientID]?.cuboid || null;
+         }
+ 
+         return null;
+@@ -174,6 +176,66 @@
+ 
+     private get mode(): Mode {
+         return this.controller.mode;
++    }
++
++    private cloudRequest = new CloudRequest();
++    private sceneGeneration = 0;
++    private destroyed = false;
++    private lowProfile = '';
++    private listeners: Array<() => void> = [];
++    private lastRender = 0;
++    private lastMeasure = 0;
++
++    private listen(target: EventTarget, name: string, callback: any, options?: any): void {
++        target.addEventListener(name, callback, options);
++        this.listeners.push(() => target.removeEventListener(name, callback, options));
++    }
++
++    public destroy(): void {
++        if (this.destroyed) return;
++        this.destroyed = true; ++this.sceneGeneration; this.cloudRequest.cancel();
++        this.listeners.splice(0).forEach((remove) => remove());
++        this.clearScene(); this.cube.dispose();
++        for (const view of Object.values(this.views)) {
++            view.controls?.dispose(); view.renderer.dispose(); view.renderer.forceContextLoss();
++        }
++    }
++
++    private async loadBoundedCloud(generation: number): Promise<void> {
++        try {
++            const config = this.model.data.configuration;
++            let focus;
++            const active = this.model.data.objects.find((row) => this.model.data.activeElement.clientID !== null &&
++                String(row.clientID) === String(this.model.data.activeElement.clientID));
++            if (config.detailedObject && active?.points.length >= 9) {
++                const p = active.points;
++                const m = new THREE.Matrix3().setFromMatrix4(new THREE.Matrix4().makeRotationFromEuler(
++                    new THREE.Euler(p[3], p[4], p[5]),
++                )).transpose().elements;
++                focus = { center: p.slice(0, 3), size: p.slice(6, 9).map(Math.abs),
++                    inverseRotation: [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]] };
++            }
++            const { cloud, stats } = await this.cloudRequest.parse(this.model.data.image.imageData,
++                config.detailedObject ? 500000 : 200000, focus);
++            // Drag geometry is committed to ObjectState on mouse-up. Rebuilding
++            // while EDIT/DRAW is active would discard that uncommitted geometry.
++            while (generation === this.sceneGeneration && !this.destroyed && this.model.mode !== Mode.IDLE) {
++                await new Promise((resolve) => setTimeout(resolve, 50));
++            }
++            if (generation !== this.sceneGeneration || this.destroyed) {
++                cloud.geometry.dispose(); (cloud.material as THREE.Material).dispose(); return;
++            }
++            // Keep the existing scene editable while a detail worker is running.
++            // Swap synchronously only after the replacement is ready.
++            this.clearScene(); this.onSceneImageLoaded(cloud); this.model.updateCanvasObjects();
++            if (this.selectedCuboid) this.updateSideViewsZoom();
++            window.dispatchEvent(new CustomEvent('cvat:3d-performance', { detail: stats }));
++            this.dispatchEvent(new CustomEvent('canvas.setup'));
++        } catch (error) {
++            if (generation === this.sceneGeneration && !this.destroyed) this.onError(error, 'data fetching');
++        } finally {
++            if (generation === this.sceneGeneration && !this.destroyed) this.model.unlockFrameUpdating();
++        }
+     }
+ 
+     public constructor(model: Canvas3dModel & Master, controller: Canvas3dController) {
+@@ -332,7 +394,7 @@
+             });
+         });
+ 
+-        canvasPerspectiveView.addEventListener('contextmenu', (e: MouseEvent): void => {
++        this.listen(canvasPerspectiveView,'contextmenu', (e: MouseEvent): void => {
+             if (this.model.data.activeElement.clientID !== null) {
+                 this.dispatchEvent(
+                     new CustomEvent('canvas.contextmenu', {
+@@ -374,8 +436,8 @@
+             }
+         });
+ 
+-        canvasPerspectiveView.addEventListener('mousedown', this.onPerspectiveDrag);
+-        window.document.addEventListener('mouseup', () => {
++        this.listen(canvasPerspectiveView,'mousedown', this.onPerspectiveDrag);
++        this.listen(window.document,'mouseup', () => {
+             this.disablePerspectiveDragging();
+             if (this.isPerspectiveBeingDragged && this.mode !== Mode.DRAG_CANVAS) {
+                 // call this body only of drag was activated inside the canvas, but not globally
+@@ -383,22 +445,22 @@
+             }
+         });
+ 
+-        canvasTopView.addEventListener('mousedown', this.startAction.bind(this, 'top'));
+-        canvasSideView.addEventListener('mousedown', this.startAction.bind(this, 'side'));
+-        canvasFrontView.addEventListener('mousedown', this.startAction.bind(this, 'front'));
+-
+-        canvasTopView.addEventListener('mousemove', this.moveAction.bind(this, 'top'));
+-        canvasSideView.addEventListener('mousemove', this.moveAction.bind(this, 'side'));
+-        canvasFrontView.addEventListener('mousemove', this.moveAction.bind(this, 'front'));
+-
+-        canvasTopView.addEventListener('mouseup', this.completeActions.bind(this));
+-        canvasTopView.addEventListener('mouseleave', this.completeActions.bind(this));
+-        canvasSideView.addEventListener('mouseup', this.completeActions.bind(this));
+-        canvasSideView.addEventListener('mouseleave', this.completeActions.bind(this));
+-        canvasFrontView.addEventListener('mouseup', this.completeActions.bind(this));
+-        canvasFrontView.addEventListener('mouseleave', this.completeActions.bind(this));
+-
+-        canvasPerspectiveView.addEventListener('mousemove', (event: MouseEvent): void => {
++        this.listen(canvasTopView,'mousedown', this.startAction.bind(this, 'top'));
++        this.listen(canvasSideView,'mousedown', this.startAction.bind(this, 'side'));
++        this.listen(canvasFrontView,'mousedown', this.startAction.bind(this, 'front'));
++
++        this.listen(canvasTopView,'mousemove', this.moveAction.bind(this, 'top'));
++        this.listen(canvasSideView,'mousemove', this.moveAction.bind(this, 'side'));
++        this.listen(canvasFrontView,'mousemove', this.moveAction.bind(this, 'front'));
++
++        this.listen(canvasTopView,'mouseup', this.completeActions.bind(this));
++        this.listen(canvasTopView,'mouseleave', this.completeActions.bind(this));
++        this.listen(canvasSideView,'mouseup', this.completeActions.bind(this));
++        this.listen(canvasSideView,'mouseleave', this.completeActions.bind(this));
++        this.listen(canvasFrontView,'mouseup', this.completeActions.bind(this));
++        this.listen(canvasFrontView,'mouseleave', this.completeActions.bind(this));
++
++        this.listen(canvasPerspectiveView,'mousemove', (event: MouseEvent): void => {
+             event.preventDefault();
+             this.isCtrlDown = event.ctrlKey;
+             if (this.mode === Mode.DRAG_CANVAS) return;
+@@ -410,7 +472,7 @@
+             this.hoverNeedsUpdate = true;
+         });
+ 
+-        canvasPerspectiveView.addEventListener('click', (e: MouseEvent): void => {
++        this.listen(canvasPerspectiveView,'click', (e: MouseEvent): void => {
+             e.preventDefault();
+             const selectionIsBlocked = ![Mode.GROUP, Mode.MERGE, Mode.SPLIT, Mode.IDLE].includes(this.mode) ||
+                 !this.views.perspective.rayCaster ||
+@@ -478,7 +540,7 @@
+             }
+         });
+ 
+-        canvasPerspectiveView.addEventListener('dblclick', (e: MouseEvent): void => {
++        this.listen(canvasPerspectiveView,'dblclick', (e: MouseEvent): void => {
+             e.preventDefault();
+             if (this.mode !== Mode.DRAW) {
+                 const { perspective: viewType } = this.views;
+@@ -625,7 +687,7 @@
+         this.views.front.controls.enabled = false;
+ 
+         BOTTOM_VIEWS.forEach((view: ViewType): void => {
+-            this.views[view].renderer.domElement.addEventListener(
++            this.listen(this.views[view].renderer.domElement,
+                 'wheel',
+                 (event: WheelEvent): void => {
+                     event.preventDefault();
+@@ -1343,6 +1405,13 @@
+     }
+ 
+     public notify(model: Canvas3dModel & Master, reason: UpdateReasons): void {
++        if (this.destroyed) return;
++        if (reason === UpdateReasons.SHAPE_ACTIVATED && model.data.configuration.lowMemory3D &&
++            model.data.configuration.detailedObject && model.data.image && !this.controller.imageIsDeleted) {
++            const generation = ++this.sceneGeneration;
++            this.cloudRequest.cancel();
++            void this.loadBoundedCloud(generation); return;
++        }
+         const resetColor = (list: ObjectState[]): void => {
+             list.forEach((state: ObjectState) => {
+                 const { clientID } = state;
+@@ -1355,10 +1424,19 @@
+ 
+         if (reason === UpdateReasons.IMAGE_CHANGED) {
+             this.statesToBeGrouped = [];
+-            this.clearScene();
++            const generation = ++this.sceneGeneration;
++            this.cloudRequest.cancel();
++            if (model.data.configuration.lowMemory3D && model.data.image && !this.controller.imageIsDeleted) {
++                this.lowProfile = JSON.stringify({ lowMemory3D: true, detailedObject: model.data.configuration.detailedObject });
++                void this.loadBoundedCloud(generation); return;
++            }
+ 
+             const onPCDLoadSuccess = (points: any): void => {
++                if (generation !== this.sceneGeneration || this.destroyed) {
++                    points.geometry.dispose(); points.material.dispose(); return;
++                }
+                 try {
++                    this.clearScene();
+                     this.onSceneImageLoaded(points);
+                     model.updateCanvasObjects();
+                 } finally {
+@@ -1370,8 +1448,9 @@
+             try {
+                 if (model.data.image) {
+                     const loader = new PCDLoader();
+-                    this.views.perspective.renderer.dispose();
++                    // Renderer survives frame changes; disposed only when the canvas closes.
+                     if (this.controller.imageIsDeleted) {
++                        this.clearScene();
+                         try {
+                             this.render();
+                             const [container] = window.document.getElementsByClassName('cvat-canvas-container');
+@@ -1401,10 +1480,12 @@
+                         }
+                     } else {
+                         model.data.image.imageData.arrayBuffer().then((data) => {
++                            if (generation !== this.sceneGeneration || this.destroyed) return;
+                             const defaultImpl = console.error;
+                             // loader.parse will throw some errors to console when nan values are in PCD file
+                             // there is not way to prevent it, because three.js opinion is that nan values
+                             // in input data is incorrect
++                            const parseStarted = performance.now();
+                             let cloud = null;
+                             try {
+                                 console.error = () => { };
+@@ -1484,6 +1565,10 @@
+                             }
+ 
+                             cloud.geometry.computeBoundingSphere();
++                            window.dispatchEvent(new CustomEvent('cvat:3d-performance', { detail: {
++                                stage: 'pointcloud', low_memory: false, parse_ms: performance.now() - parseStarted,
++                                input_points: position.length / 3, displayed_points: position.length / 3, lod: false,
++                            } }));
+                             onPCDLoadSuccess(cloud);
+                         });
+                         const [overlay] = window.document.getElementsByClassName('cvat_3d_canvas_deleted_overlay');
+@@ -1498,6 +1583,17 @@
+             }
+         } else if (reason === UpdateReasons.CONFIG_UPDATED) {
+             const config = { ...model.data.configuration };
++            const profile = JSON.stringify({ lowMemory3D: config.lowMemory3D, detailedObject: config.detailedObject });
++            if (this.lowProfile && !config.lowMemory3D) {
++                this.lowProfile = '';
++                this.notify(model, UpdateReasons.IMAGE_CHANGED); return;
++            }
++            if (config.lowMemory3D && this.lowProfile !== profile && model.data.image && !this.controller.imageIsDeleted) {
++                this.lowProfile = profile;
++                const generation = ++this.sceneGeneration;
++                this.cloudRequest.cancel();
++                void this.loadBoundedCloud(generation); return;
++            }
+             for (const key of Object.keys(this.drawnObjects)) {
+                 const clientID = +key;
+                 const { cuboid, data } = this.drawnObjects[clientID];
+@@ -1650,9 +1746,10 @@
+         this.drawnObjects = {};
+         this.activatedElementID = null;
+ 
++        const disposed = new Set<unknown>();
+         Object.keys(this.views).forEach((view: string): void => {
+             const viewData = this.views[view as keyof Views];
+-            disposeScene(viewData.scene);
++            disposeScene(viewData.scene, disposed);
+         });
+     }
+ 
+@@ -1829,8 +1926,8 @@
+             new THREE.PlaneGeometry(
+                 canvasTopView.offsetHeight,
+                 canvasTopView.offsetWidth,
+-                canvasTopView.offsetHeight,
+-                canvasTopView.offsetWidth,
++                1,
++                1,
+             ),
+             new THREE.MeshBasicMaterial({
+                 color: 0xffffff,
+@@ -1853,8 +1950,8 @@
+             new THREE.PlaneGeometry(
+                 canvasSideView.offsetHeight,
+                 canvasSideView.offsetWidth,
+-                canvasSideView.offsetHeight,
+-                canvasSideView.offsetWidth,
++                1,
++                1,
+             ),
+             new THREE.MeshBasicMaterial({
+                 color: 0x00ff00,
+@@ -1876,8 +1973,8 @@
+             new THREE.PlaneGeometry(
+                 canvasFrontView.offsetHeight,
+                 canvasFrontView.offsetWidth,
+-                canvasFrontView.offsetHeight,
+-                canvasFrontView.offsetWidth,
++                1,
++                1,
+             ),
+             new THREE.MeshBasicMaterial({
+                 color: 0xffffff,
+@@ -2011,6 +2108,10 @@
+     };
+ 
+     public render(): void {
++        if (this.destroyed) return;
++        const now = performance.now();
++        if (this.model.data.configuration.lowMemory3D && now - this.lastRender < 1000 / 30) return;
++        this.lastRender = now;
+         Object.keys(this.views).forEach((view: string): void => {
+             const viewType = this.views[view as keyof Views];
+             if (!(viewType.controls && viewType.camera && viewType.rayCaster)) return;
+@@ -2022,7 +2123,9 @@
+             } else {
+                 viewType.camera.updateProjectionMatrix();
+             }
+-            viewType.renderer.render(viewType.scene, viewType.camera);
++            if (viewType.renderer.domElement.clientWidth > 0 && viewType.renderer.domElement.clientHeight > 0) {
++                viewType.renderer.render(viewType.scene, viewType.camera);
++            }
+             if (view === ViewType.PERSPECTIVE && viewType.scene.children.length !== 0) {
+                 this.renderRayCaster(viewType);
+             }
+@@ -2048,7 +2151,16 @@
+                 }
+             }
+         });
+-    }
++        if (now - this.lastMeasure > 1000) {
++                this.lastMeasure = now;
++                window.dispatchEvent(new CustomEvent('cvat:3d-performance', { detail: {
++                    stage: 'render', render_ms: performance.now() - now,
++                    geometries: Object.values(this.views).reduce((sum, v) => sum + v.renderer.info.memory.geometries, 0),
++                    textures: Object.values(this.views).reduce((sum, v) => sum + v.renderer.info.memory.textures, 0),
++                } }));
++            }
++    }
++
+ 
+     private adjustPerspectiveCameras(): void {
+         const { camera: cameraTop } = this.views.top;
+diff --git a/cvat-canvas3d/src/typescript/utils.ts b/cvat-canvas3d/src/typescript/utils.ts
+--- a/cvat-canvas3d/src/typescript/utils.ts
++++ b/cvat-canvas3d/src/typescript/utils.ts
+@@ -4,18 +4,22 @@
+ 
+ import * as THREE from 'three';
+ 
+-function disposeMaterial(material: THREE.Material): void {
++function disposeMaterial(material: THREE.Material, disposed: Set<unknown>): void {
++    if (disposed.has(material)) return;
++    disposed.add(material);
+     Object.keys(material).forEach((prop) => {
+         const value = material[prop];
+-        if (value instanceof THREE.Texture) {
++        if (value instanceof THREE.Texture && !disposed.has(value)) {
++            disposed.add(value);
+             value?.dispose();
+         }
+     });
+     material.dispose();
+ }
+ 
+-export function disposeObjectResources(object: THREE.Object3D): void {
+-    if ('geometry' in object && object.geometry instanceof THREE.BufferGeometry) {
++export function disposeObjectResources(object: THREE.Object3D, disposed = new Set<unknown>()): void {
++    if ('geometry' in object && object.geometry instanceof THREE.BufferGeometry && !disposed.has(object.geometry)) {
++        disposed.add(object.geometry);
+         object.geometry.dispose();
+     }
+ 
+@@ -23,33 +27,34 @@
+         if (Array.isArray(object.material)) {
+             object.material.forEach((material) => {
+                 if (material instanceof THREE.Material) {
+-                    disposeMaterial(material);
++                    disposeMaterial(material, disposed);
+                 }
+             });
+         } else if (object.material instanceof THREE.Material) {
+-            disposeMaterial(object.material);
++            disposeMaterial(object.material, disposed);
+         }
+     }
+ 
+-    if ('renderTarget' in object && object.renderTarget instanceof THREE.WebGLRenderTarget) {
++    if ('renderTarget' in object && object.renderTarget instanceof THREE.WebGLRenderTarget && !disposed.has(object.renderTarget)) {
++        disposed.add(object.renderTarget);
+         object.renderTarget.dispose();
+     }
+ }
+ 
+-export function disposeObject3D(object: THREE.Object3D): void {
++export function disposeObject3D(object: THREE.Object3D, disposed = new Set<unknown>()): void {
+     while (object.children.length > 0) {
+         const child = object.children[0];
+         object.remove(child);
+-        disposeObject3D(child);
++        disposeObject3D(child, disposed);
+     }
+ 
+-    disposeObjectResources(object);
++    disposeObjectResources(object, disposed);
+ }
+ 
+-export function disposeScene(scene: THREE.Scene): void {
++export function disposeScene(scene: THREE.Scene, disposed = new Set<unknown>()): void {
+     while (scene.children.length > 0) {
+         const child = scene.children[0];
+         scene.remove(child);
+-        disposeObject3D(child);
++        disposeObject3D(child, disposed);
+     }
+ }
+diff --git a/cvat-ui/src/components/annotation-page/canvas/views/canvas2d/canvas-wrapper.tsx b/cvat-ui/src/components/annotation-page/canvas/views/canvas2d/canvas-wrapper.tsx
+--- a/cvat-ui/src/components/annotation-page/canvas/views/canvas2d/canvas-wrapper.tsx
++++ b/cvat-ui/src/components/annotation-page/canvas/views/canvas2d/canvas-wrapper.tsx
+@@ -7,7 +7,7 @@
+ 
+ import React from 'react';
+ import { connect } from 'react-redux';
+-import Spin from 'antd/lib/spin';
++import PlaybackLoading from '../../playback-loading';
+ import Popover from 'antd/lib/popover';
+ import Icon, { UpOutlined } from '@ant-design/icons';
+ import notification from 'antd/lib/notification';
+@@ -1361,9 +1361,7 @@
+                 <CanvasTipsComponent ref={this.canvasTipsRef} />
+                 {
+                     !canvasIsReady && (
+-                        <div className='cvat-spinner-container'>
+-                            <Spin className='cvat-spinner' />
+-                        </div>
++                        <PlaybackLoading />
+                     )
+                 }
+ 

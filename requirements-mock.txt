@@ -1,0 +1,6 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+pydantic>=2.10,<3
+numpy>=1.26,<3
+scipy>=1.13,<2
+python-dotenv>=1,<2

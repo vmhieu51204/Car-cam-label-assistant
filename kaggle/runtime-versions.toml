@@ -1,0 +1,10 @@
+# Observed on private KITTI 0013 SAM3 benchmark, Kaggle Tesla T4, 2026-09-30.
+# This records the actual runtime; it is not yet a pip requirements file.
+sam3_git_commit = "2345a4ad109ac29c569da749c91d84f10dc08c40"
+sam3_checkpoint_sha256 = "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e"
+python = "3.12.13"
+torch = "2.10.0+cu128"
+torchvision = "0.25.0+cu128"
+transformers = "5.0.0"
+numpy = "2.0.2"
+cuda = "12.8"

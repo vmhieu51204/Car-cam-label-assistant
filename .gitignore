@@ -1,0 +1,14 @@
+.venv*/
+__pycache__/
+*.py[cod]
+.env
+state/
+.test-cache/
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+*.pt
+*.pth
+
+ui/node_modules/

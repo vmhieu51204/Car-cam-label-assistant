@@ -1,0 +1,18 @@
+{
+  "schema": "autolabel-manual-gt/v1",
+  "frames": [
+    {"video_id": "synthetic", "frame": 0, "width": 300, "height": 200},
+    {"video_id": "synthetic", "frame": 1, "width": 300, "height": 200},
+    {"video_id": "synthetic", "frame": 2, "width": 300, "height": 200},
+    {"video_id": "synthetic", "frame": 3, "width": 300, "height": 200},
+    {"video_id": "synthetic", "frame": 4, "width": 300, "height": 200},
+    {"video_id": "synthetic", "frame": 5, "width": 300, "height": 200}
+  ],
+  "annotations": [
+    {"video_id": "synthetic", "frame": 0, "track_id": "car1", "class": "car", "box": [10, 10, 50, 50], "occlusion": "none"},
+    {"video_id": "synthetic", "frame": 1, "track_id": "car1", "class": "car", "box": [12, 10, 52, 50], "occlusion": "partial"},
+    {"video_id": "synthetic", "frame": 2, "track_id": "car1", "class": "car", "box": [14, 10, 54, 50], "occlusion": "heavy"},
+    {"video_id": "synthetic", "frame": 3, "track_id": "car1", "class": "car", "box": [16, 10, 56, 50]},
+    {"video_id": "synthetic", "frame": 4, "track_id": "car1", "class": "car", "box": [18, 10, 58, 50], "occlusion": "none"}
+  ]
+}

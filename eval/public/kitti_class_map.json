@@ -1,0 +1,11 @@
+{
+  "Car": "car",
+  "Pedestrian": "person",
+  "Van": null,
+  "Truck": null,
+  "Cyclist": null,
+  "Person": null,
+  "Person_sitting": null,
+  "Tram": null,
+  "Misc": null
+}

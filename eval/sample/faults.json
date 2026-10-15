@@ -1,0 +1,9 @@
+{
+  "schema": "autolabel-faults/v1",
+  "faults": [
+    {"frame_index": 0, "verdict": "possible_missing", "severity": 1.0},
+    {"frame_index": 1, "verdict": "wrong_class", "severity": 0.85},
+    {"frame_index": 2, "verdict": "bad_extent", "severity": 0.7},
+    {"frame_index": 3, "verdict": "agree", "severity": 0.0}
+  ]
+}

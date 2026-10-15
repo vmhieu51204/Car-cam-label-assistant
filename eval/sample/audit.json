@@ -1,0 +1,8 @@
+{
+  "evidence": [
+    {"frame_index": 0, "verdict": "possible_missing"},
+    {"frame_index": 1, "verdict": "wrong_class"},
+    {"frame_index": 2, "verdict": "bad_extent"},
+    {"frame_index": 3, "verdict": "agree"}
+  ]
+}

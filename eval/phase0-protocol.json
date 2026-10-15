@@ -1,0 +1,54 @@
+{
+  "schema": "autolabel-phase0-protocol/v1",
+  "seed": 42,
+  "runs": [
+    {
+      "sequence": "0013",
+      "native_frame_count": 340,
+      "result": "state/sam3-fn/0013/result.json",
+      "mapping": "state/sam3-fn/0013/manifest.json",
+      "labels": "../AutoLabelDatasets/training/label_02/0013.txt",
+      "config_id": "fn-baseline",
+      "class_map": {
+        "Car": "car",
+        "Pedestrian": "person"
+      },
+      "source_fps": 10,
+      "fps_provenance": "dataset_fps_fallback_not_recorded_timestamps",
+      "sha256": {
+        "result": "066065323f519e678706908cec05a74f2e133040db12e042b333b9abe8759b1f",
+        "mapping": "c1cc7de2d0becd0b9fd9a847556cfc6d2027b2c40f73d0d314821706b28f6006",
+        "labels": "29275f8a808298e4c816787bcc68d8cb891a1eeaf29e80081548af4493a41180"
+      }
+    },
+    {
+      "sequence": "0020",
+      "native_frame_count": 837,
+      "result": "state/benchmarks/kitti-0020-sam3/overlap-output/result.json",
+      "mapping": "eval/public/kitti/0020/manifest.json",
+      "labels": "../AutoLabelDatasets/training/label_02/0020.txt",
+      "config_id": "text-window-50-overlap",
+      "class_map": {
+        "Car": "car",
+        "Pedestrian": "person"
+      },
+      "source_fps": 10,
+      "fps_provenance": "dataset_fps_fallback_not_recorded_timestamps",
+      "sha256": {
+        "result": "e1fa15f4d3ad2913122e02da31ce413970eec915a910776ce9d0472d3a78aa21",
+        "mapping": "ccd79bbd35fc9ed35b7e399524af6c851317757c47d6a47ffb9bc54e20bc55e3",
+        "labels": "8e14201118adc5264ec228650715bcf5828a43abdf066cc2a02ac15982f23a2a"
+      }
+    }
+  ],
+  "profile_jobs": {
+    "videotest_10fps": "state/video-jobs/d6ce9d51-b542-4e41-a1c8-0c197ec1dabe"
+  },
+  "claude_jobs": {
+    "videotest_10fps": {
+      "database": "state/autolabel.sqlite3",
+      "job_id": "d6ce9d51-b542-4e41-a1c8-0c197ec1dabe"
+    }
+  },
+  "note": "Frozen existing artifacts; no new model run. These clips do not establish general quality."
+}

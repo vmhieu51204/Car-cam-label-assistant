@@ -1,0 +1,157 @@
+diff --git a/cvat/apps/dataset_manager/task.py b/cvat/apps/dataset_manager/task.py
+index 9cff894f9..63de50914 100644
+--- a/cvat/apps/dataset_manager/task.py
++++ b/cvat/apps/dataset_manager/task.py
+@@ -543,7 +543,10 @@ class JobAnnotation:
+         self._save_tracks_to_db(data["tracks"])
+         self._save_intervals_to_db(data["intervals"])
+ 
++    @transaction.atomic
+     def create(self, data):
++        # Serialize every writer with the AutoLabel content-revision guard.
++        models.Job.objects.select_for_update().get(pk=self.db_job.pk)
+         data = self._validate_input_annotations(data)
+ 
+         self._create(data)
+@@ -552,7 +555,10 @@ class JobAnnotation:
+         if not self._data_is_empty(self.data):
+             self._set_updated_date()
+ 
++    @transaction.atomic
+     def put(self, data):
++        # Serialize every writer with the AutoLabel content-revision guard.
++        models.Job.objects.select_for_update().get(pk=self.db_job.pk)
+         data = self._validate_input_annotations(data)
+ 
+         deleted_data = self._delete()
+@@ -566,7 +572,10 @@ class JobAnnotation:
+         if not deleted_data_is_empty or not self._data_is_empty(self.data):
+             self._set_updated_date()
+ 
++    @transaction.atomic
+     def update(self, data):
++        # Serialize every writer with the AutoLabel content-revision guard.
++        models.Job.objects.select_for_update().get(pk=self.db_job.pk)
+         data = self._validate_input_annotations(data)
+ 
+         # in case with "update" must be called prior any annotations in database changes
+@@ -680,7 +689,10 @@ class JobAnnotation:
+         self.reset()
+         return deleted_data
+ 
++    @transaction.atomic
+     def delete(self, data=None):
++        # Serialize every writer with the AutoLabel content-revision guard.
++        models.Job.objects.select_for_update().get(pk=self.db_job.pk)
+         deleted_data = self._delete(data)
+         if not self._data_is_empty(deleted_data):
+             self._set_updated_date()
+diff --git a/cvat/apps/engine/permissions.py b/cvat/apps/engine/permissions.py
+index 13ba49f31..613e8bd63 100644
+--- a/cvat/apps/engine/permissions.py
++++ b/cvat/apps/engine/permissions.py
+@@ -1000,6 +1000,7 @@ class JobPermission(OpenPolicyAgentPermission, DownloadExportedExtension):
+             ("list", "GET"): Scopes.LIST,
+             ("create", "POST"): Scopes.CREATE,
+             ("retrieve", "GET"): Scopes.VIEW,
++            ("autolabel_permission", "GET"): Scopes.UPDATE_ANNOTATIONS,
+             ("partial_update", "PATCH"): Scopes.UPDATE,
+             ("destroy", "DELETE"): Scopes.DELETE,
+             ("annotations", "GET"): Scopes.VIEW_ANNOTATIONS,
+diff --git a/cvat/apps/engine/views.py b/cvat/apps/engine/views.py
+index 2c09ee931..51e9712a0 100644
+--- a/cvat/apps/engine/views.py
++++ b/cvat/apps/engine/views.py
+@@ -4,6 +4,7 @@
+ # SPDX-License-Identifier: MIT
+ 
+ import itertools
++from cvat.apps.engine.autolabel_revision import annotation_revision, guarded_create
+ import os
+ import os.path as osp
+ import re
+@@ -2297,6 +2298,16 @@ class JobViewSet(
+         else:
+             return JobWriteSerializer
+ 
++    @extend_schema(
++        methods=["GET"],
++        summary="Check permission to run AutoLabel on a job",
++        responses={"200": OpenApiResponse(description="User may update job annotations")},
++    )
++    @action(detail=True, methods=["GET"], url_path="autolabel-permission")
++    def autolabel_permission(self, request: ExtendedRequest, pk: int):
++        self.get_object()  # Enforce the same OPA scope as updating job annotations.
++        return Response({"allowed": True})
++
+     @transaction.atomic
+     def perform_create(self, serializer):
+         super().perform_create(serializer)
+@@ -2520,6 +2531,9 @@ class JobViewSet(
+                 )
+ 
+             annotations = dm.task.get_job_data(self._object.pk)
++            if request.headers.get("X-Autolabel-Revision") == "1":
++                return Response({**annotations, "autolabel_revision": annotation_revision(annotations)},
++                                headers={"X-Autolabel-Revision-Guard": "1"})
+             return Response(annotations)
+ 
+         elif request.method == "POST" or request.method == "OPTIONS":
+@@ -2552,6 +2566,18 @@ class JobViewSet(
+             )
+             if serializer.is_valid(raise_exception=True):
+                 try:
++                    expected = request.headers.get("X-Autolabel-Expected-Revision")
++                    if expected is not None:
++                        proposal_id = request.headers.get("X-Autolabel-Proposal-Id", "")
++                        if action != "create" or not proposal_id or len(proposal_id) > 200:
++                            return Response({"detail": "Invalid AutoLabel proposal create"}, status=400)
++                        code, data = guarded_create(
++                            job_id=pk, data=serializer.validated_data,
++                            expected_revision=expected, proposal_id=proposal_id,
++                            transaction=transaction, job_model=models.Job,
++                            get_annotations=dm.task.get_job_data, patch_annotations=dm.task.patch_job_data,
++                        )
++                        return Response(data, status=code, headers={"X-Autolabel-Revision-Guard": "1"})
+                     data = dm.task.patch_job_data(pk, serializer.validated_data, action)
+                 except (AttributeError, IntegrityError) as e:
+                     return Response(data=str(e), status=status.HTTP_400_BAD_REQUEST)
+diff --git a/tests/python/rest_api/test_jobs.py b/tests/python/rest_api/test_jobs.py
+index 0e028c780..c03ea1ce2 100644
+--- a/tests/python/rest_api/test_jobs.py
++++ b/tests/python/rest_api/test_jobs.py
+@@ -1215,6 +1215,34 @@ class TestGetAnnotations:
+         )
+ 
+ 
++@pytest.mark.usefixtures("restore_db_per_function")
++class TestAutoLabelJobPermission:
++    @pytest.mark.parametrize(
++        "role, job_staff, expected_status",
++        [
++            ("maintainer", False, HTTPStatus.OK),
++            ("supervisor", False, HTTPStatus.FORBIDDEN),
++            ("supervisor", True, HTTPStatus.OK),
++            ("worker", False, HTTPStatus.FORBIDDEN),
++        ],
++    )
++    def test_probe_matches_annotation_update_scope(
++        self, role, job_staff, expected_status, find_job_staff_user, find_users, jobs_by_org,
++    ):
++        users = find_users(role=role, org=2)
++        username, job_id = find_job_staff_user(jobs_by_org[2], users, job_staff)
++        with make_api_client(username) as client:
++            _, response = client.call_api(
++                f"/api/jobs/{job_id}/autolabel-permission",
++                method="GET",
++                _parse_response=False,
++                _check_status=False,
++            )
++        assert response.status == expected_status
++        if expected_status == HTTPStatus.OK:
++            assert json.loads(response.data) == {"allowed": True}
++
++
+ @pytest.mark.usefixtures("restore_db_per_function")
+ class TestPatchJobAnnotations:
+     def _check_response(self, username, jid, expect_success, data=None):

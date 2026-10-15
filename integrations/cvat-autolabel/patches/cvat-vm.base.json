@@ -1,0 +1,27 @@
+{
+  "revision": "6cbc17603bda004f699e434dbd4d6c6ce88e9409",
+  "files": {
+    "cvat/apps/engine/models.py": "895dbad4ad3a8d998ae416dd3b149120629d900a15eac6e227bfd67c0d926b8c",
+    "cvat/apps/engine/permissions.py": "2f424a17b497e3cddab945d9eeea3ed82576f18199abe4ff55e61b346cde0eea",
+    "cvat/apps/engine/views.py": "eaa91896bda14046d1ef204a041259a21512699362116039ac3b8ea2c2a1570d",
+    "cvat-core/src/annotations-saver.ts": "f32773ba6277dc1fc284429fe2c0c7d9ec78a2e57df57074b34b73b38565d74d",
+    "cvat-core/src/session.ts": "b1135fd1fe53fc75bde651d6a89e92c67c941b119fe79ce915dbc927441d2b4e",
+    "cvat-core/src/annotations.ts": "0e755c40ec4d30ae720eae9c50d41fc63cdf1cd9c241edce67392053249a2cc7",
+    "cvat-ui/src/components/annotation-page/annotation-page.tsx": "fbe7f9b03b1502b52a17718cbc3a5093604031c9d8c8d50673ba13320a361a21",
+    "cvat-ui/src/components/header/settings-modal/settings-modal.tsx": "55490cc64f5ab8a5a1cd50835469a6bcd660b3b92785f807fec2640f3b8f61b4",
+    "cvat-data/src/ts/cvat-data.ts": "b1b073a167c584a3d26a83636f5c81d5448acf571284d76ade1294b54e33b8a8",
+    "cvat-core/src/config.ts": "c904543b4c6f7afc0364a9f7a504592e22311d4ce31f3932c338e9cc5c37a3d4",
+    "cvat-core/src/index.ts": "a87eaafc49e432fd71c904ed63184dc40d183acb8a53f8cb2855312311295d0e",
+    "cvat-core/src/api.ts": "77035d69f8acb7eabc73e9585752a9a1fd31be6a3be1f2dafee40c68726cb952",
+    "cvat-core/src/server-proxy.ts": "fc09c27530a58bea1aab3d513536448736e5a68dd1caae90c616db23964a2ac9",
+    "cvat-core/src/frames.ts": "f0ad00cc10ad33dfb2597538d37b4a268b0b74daecc15d12e702a8ba32ed8cb6",
+    "cvat-core/src/session-implementation.ts": "ef76c37718d91c1cebd98c9412bff1a9c4d10d9f4b1d8cba51e7b9ebc9fc77af",
+    "cvat-ui/src/components/annotation-page/canvas/views/canvas3d/canvas-wrapper3D.tsx": "1d1bab1112a0e5cd7730bc5d4c6c5b920a84a3b885644e0d62d25c21e7745c3c",
+    "cvat-ui/src/components/annotation-page/canvas/views/context-image/context-image.tsx": "f0e3b6c90a230988d43a1ef939401261b9acada8c931dcbfaab4181febc80932",
+    "cvat-canvas3d/src/typescript/canvas3dModel.ts": "73cee3419bd862ee0a832f7511a096d48b920dba33f546e84a0f5f14e4e0e0af",
+    "cvat-canvas3d/src/typescript/canvas3d.ts": "d6882d1400a261d86215dfb8f0f7c5bff5bdaeeeae77abc20eb636bb1905e6de",
+    "cvat-canvas3d/src/typescript/canvas3dView.ts": "e1abf50a91b1d103e9850dafdfa7b916188c5168eb2a7ad0d7c7e6273e8c8582",
+    "cvat-canvas3d/src/typescript/utils.ts": "42bc30ef6e3abcfb9a596e815c7a94983aab08d2d26b904ca5cb65ac44f4bba3",
+    "cvat-ui/src/components/annotation-page/canvas/views/canvas2d/canvas-wrapper.tsx": "5300db1715e619a7661ae69aded4b2f480021dfb12d1dd3f6602acfff3f55758"
+  }
+}
