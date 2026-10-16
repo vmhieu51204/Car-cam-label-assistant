@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/cvat-ai/cvat",
+  "revision": "30d86df3cd413dba39fcbf39eead67b72e8c016a",
+  "component": "cvat-canvas",
+  "version": "2.20.10",
+  "local_compatibility": [
+    "Default import for mutable svg.js CommonJS extension API in esbuild"
+  ]
+}

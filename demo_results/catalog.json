@@ -1,0 +1,21 @@
+{
+  "schema": "car-cam-demo-catalog/v1",
+  "videos": [
+    {
+      "id": "kitti-0000-exp123-frames0-29",
+      "name": "kitti-0000-exp123-frames0-29.mp4",
+      "frame_count": 30,
+      "fps": 10.0,
+      "width": 1242,
+      "height": 374,
+      "track_count": 15,
+      "directory": "kitti-0000-exp123-frames0-29",
+      "source_sha256": "e16ca826d6a9cbee6711983cc9c4c896073015d1ef6fffb93b39ef8c16bcd569",
+      "result_sha256": "221a743f4f5f9389991045b05963b4c484882c3f5e85e297c1fc042ed0733c5d",
+      "data_source": "sam3-kaggle",
+      "checkpoint_sha256": "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e",
+      "model_version": "sam3@2345a4ad109ac29c569da749c91d84f10dc08c40"
+    }
+  ],
+  "default_video_id": "kitti-0000-exp123-frames0-29"
+}

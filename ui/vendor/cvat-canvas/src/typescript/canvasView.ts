@@ -1,0 +1,5142 @@
+// Copyright (C) 2019-2022 Intel Corporation
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import polylabel from 'polylabel';
+import { fabric } from 'fabric';
+import SVG from 'svg.js';
+import * as martinez from 'martinez-polygon-clipping';
+
+import 'svg.draggable.js';
+import 'svg.resize.js';
+import 'svg.select.js';
+
+import { CanvasController } from './canvasController';
+import { Listener, Master } from './master';
+import { DrawHandler, DrawHandlerImpl } from './drawHandler';
+import { MasksHandler, MasksHandlerImpl } from './masksHandler';
+import { EditHandler, EditHandlerImpl } from './editHandler';
+import { MergeHandler, MergeHandlerImpl } from './mergeHandler';
+import { SplitHandler, SplitHandlerImpl } from './splitHandler';
+import { ObjectSelector, ObjectSelectorImpl } from './objectSelector';
+import { GroupHandler, GroupHandlerImpl } from './groupHandler';
+import { SelectHandler, SelectHandlerImpl } from './selectHandler';
+import { SliceHandler, SliceHandlerImpl } from './sliceHandler';
+import { RegionSelector, RegionSelectorImpl } from './regionSelector';
+import { ZoomHandler, ZoomHandlerImpl } from './zoomHandler';
+import { InteractionHandler, InteractionHandlerImpl } from './interactionHandler';
+import { AutoborderHandler, AutoborderHandlerImpl } from './autoborderHandler';
+import consts from './consts';
+import {
+    translateToSVG, translateFromSVG, translateToCanvas, translateFromCanvas,
+    pointsToNumberArray, parsePoints, displayShapeSize, scalarProduct,
+    vectorLength, ShapeSizeElement, DrawnState, rotate2DPoints,
+    readPointsFromShape, setupSkeletonEdges, makeSVGFromTemplate,
+    imageDataToDataURL, RLEToImageData, stringifyPoints, imageDataToRLE,
+    composeShapeDimensions, getRoundedRotation,
+    clamp, validateUnionResult, processPolygonUnionResult,
+    applySnapToShapePoint, isPolygonSelfIntersecting,
+} from './shared';
+import {
+    CanvasModel, Geometry, UpdateReasons, FrameZoom, ActiveElement,
+    DrawData, MergeData, SplitData, Mode, Size, Configuration,
+    InteractionResult, InteractionData, ColorBy, HighlightedElements,
+    HighlightSeverity, GroupData, SelectData, JoinData,
+    MultiSelectModifier, CanvasHistorySource,
+} from './canvasModel';
+
+const SELECTED_OBJECTS_BOX_PADDING = 6;
+const SELECTED_OBJECTS_BOX_STROKE_WIDTH = 2;
+
+interface SelectionPreviewHandler {
+    el: SVG.Element;
+    nested?: SVG.Container;
+    observerInst?: MutationObserver;
+    handler(): void;
+    observe(): void;
+}
+
+interface SelectionPreviewShape {
+    shape: SVG.Shape;
+    rotation: number;
+    transforms: { element: SVG.Element; matrix: SVG.Matrix; original: string | null }[];
+    selectionHandler?: SelectionPreviewHandler;
+}
+
+export interface CanvasView {
+    html(): HTMLDivElement;
+    setupConflictRegions(clientID: number): number[];
+    translateFromSVG(points: number[]): number[];
+    undo(): boolean;
+    redo(): boolean;
+}
+
+export class CanvasViewImpl implements CanvasView, Listener {
+    private text: SVGSVGElement;
+    private adoptedText: SVG.Container;
+    private background: HTMLCanvasElement;
+    private masksContent: HTMLCanvasElement;
+    private bitmap: HTMLCanvasElement;
+    private bitmapUpdateReqId: number;
+    private grid: SVGSVGElement;
+    private content: SVGSVGElement;
+    private attachmentBoard: HTMLDivElement;
+    private adoptedContent: SVG.Container;
+    private canvas: HTMLDivElement;
+    private gridPath: SVGPathElement;
+    private gridPattern: SVGPatternElement;
+    private controller: CanvasController;
+    private svgShapes: Record<number, SVG.Shape>;
+    private svgTexts: Record<number, SVG.Text>;
+    private isImageLoading: boolean;
+    private issueRegionPattern_1: SVG.Pattern;
+    private issueRegionPattern_2: SVG.Pattern;
+    private drawnStates: Record<number, DrawnState>;
+    private drawnIssueRegions: Record<number, SVG.Shape>;
+    private geometry: Geometry;
+    private drawHandler: DrawHandler;
+    private masksHandler: MasksHandler;
+    private editHandler: EditHandler;
+    private mergeHandler: MergeHandler;
+    private splitHandler: SplitHandler;
+    private groupHandler: GroupHandler;
+    private selectHandler: SelectHandler;
+    private sliceHandler: SliceHandler;
+    private regionSelector: RegionSelector;
+    private objectSelector: ObjectSelector;
+    private zoomHandler: ZoomHandler;
+    private autoborderHandler: AutoborderHandler;
+    private interactionHandler: InteractionHandler;
+    private activeElement: ActiveElement;
+    private highlightedElements: HighlightedElements;
+    private configuration: Configuration;
+    private snapToAngleResize: number;
+    private draggableShape: SVG.Shape | null;
+    private resizableShape: SVG.Shape | null;
+    private skeletonResizerRefreshRequest: number | null;
+    private ctrlPressed: boolean;
+    private pendingSelectionEvent: MouseEvent | null;
+    private selectionStartedWithModifier: boolean;
+    private selectedObjects: number[];
+    private selectedObjectsSet: Set<number>;
+    private selectedObjectsBox: SVG.Rect | null;
+    private selectedObjectsBoxBitmap: SVG.Rect | null;
+    private selectedObjectsLabel: HTMLDivElement | null;
+    private selectionPasteData: DrawData | null;
+    private selectionPasteStates: any[];
+    private selectionPasteOffset: { x: number; y: number };
+    private selectionPasteCenter: { x: number; y: number } | null;
+    private selectionPasteStartedAt: number;
+    private selectionPasteShapes: SelectionPreviewShape[];
+    private selectionPreviewFrame: number | null;
+    private selectionPreviewUpdate: (() => void) | null;
+    private cancelSelectionDrag: (() => void) | null;
+    private innerObjectsFlags: {
+        drawHidden: Record<number, boolean>;
+        editHidden: Record<number, boolean>;
+        sliceHidden: Record<number, boolean>;
+    };
+
+    private set mode(value: Mode) {
+        this.controller.mode = value;
+        this.canvas?.classList.toggle('cvat_canvas_selecting_objects', value === Mode.SELECT);
+    }
+
+    private get mode(): Mode {
+        return this.controller.mode;
+    }
+
+    private onMessage = (message: string | null, topic?: string): void => {
+        this.canvas.dispatchEvent(
+            new CustomEvent('canvas.message', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    topic,
+                    message,
+                },
+            }),
+        );
+    };
+
+    private onError = (exception: unknown, domain?: string): void => {
+        this.canvas.dispatchEvent(
+            new CustomEvent('canvas.error', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    domain,
+                    exception: exception instanceof Error ?
+                        exception : new Error(`Unknown exception: "${exception}"`),
+                },
+            }),
+        );
+    };
+
+    private onWarning = (message: string, domain?: string): void => {
+        this.canvas.dispatchEvent(
+            new CustomEvent('canvas.warning', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    domain,
+                    message,
+                },
+            }),
+        );
+    };
+
+    private stateIsLocked(state: any): boolean {
+        const { configuration } = this.controller;
+        return state.lock || configuration.forceDisableEditing;
+    }
+
+    private translateToCanvas(points: number[]): number[] {
+        const { offset } = this.controller.geometry;
+        return translateToCanvas(offset, points);
+    }
+
+    private translateFromCanvas(points: number[]): number[] {
+        const { offset } = this.controller.geometry;
+        return translateFromCanvas(offset, points);
+    }
+
+    private translatePointsFromRotatedShape(
+        shape: SVG.Shape, points: number[], cx: number = null, cy: number = null,
+    ): number[] {
+        const { rotation } = shape.transform();
+        // currently shape is rotated and SHIFTED somehow additionally (css transform property)
+        // let's remove rotation to get correct transformation matrix (element -> screen)
+        // correct means that we do not consider points to be rotated
+        // because rotation property is stored separately and already saved
+        if (cx !== null && cy !== null) {
+            shape.rotate(0, cx, cy);
+        } else {
+            shape.rotate(0);
+        }
+
+        const result = [];
+
+        try {
+            // get each point and apply a couple of matrix transformation to it
+            const point = this.content.createSVGPoint();
+            // matrix to convert from ELEMENT coordinate system to CLIENT coordinate system
+            const ctm = (
+                (shape.node as any) as SVGRectElement | SVGPolygonElement | SVGPolylineElement | SVGGElement
+            ).getScreenCTM();
+            // matrix to convert from CLIENT coordinate system to CANVAS coordinate system
+            const ctm1 = this.content.getScreenCTM().inverse();
+            // NOTE: I tried to use element.getCTM(), but this way does not work on firefox
+
+            for (let i = 0; i < points.length; i += 2) {
+                point.x = points[i];
+                point.y = points[i + 1];
+                let transformedPoint = point.matrixTransform(ctm);
+                transformedPoint = transformedPoint.matrixTransform(ctm1);
+
+                result.push(transformedPoint.x, transformedPoint.y);
+            }
+        } finally {
+            if (cx !== null && cy !== null) {
+                shape.rotate(rotation, cx, cy);
+            } else {
+                shape.rotate(rotation);
+            }
+        }
+
+        return result;
+    }
+
+    private isInnerHidden(clientID: number): boolean {
+        return this.innerObjectsFlags.drawHidden[clientID] ||
+            this.innerObjectsFlags.editHidden[clientID] ||
+            this.innerObjectsFlags.sliceHidden[clientID] ||
+            false;
+    }
+
+    private setupInnerFlags(clientID: number, path: keyof CanvasViewImpl['innerObjectsFlags'], value: boolean): void {
+        this.innerObjectsFlags[path][clientID] = value;
+        const shape = this.svgShapes[clientID];
+        const text = this.svgTexts[clientID];
+        const state = this.drawnStates[clientID];
+
+        if (value && clientID === this.controller.activeElement.clientID) {
+            this.deactivate();
+        }
+
+        if (value) {
+            if (shape) {
+                (state.shapeType === 'points' ? shape.remember('_selectHandler').nested : shape).addClass(
+                    'cvat_canvas_hidden',
+                );
+            }
+
+            if (text) {
+                text.addClass('cvat_canvas_hidden');
+            }
+        } else {
+            delete this.innerObjectsFlags[path][clientID];
+
+            if (state) {
+                if (!state.outside && !state.hidden) {
+                    if (shape) {
+                        (state.shapeType === 'points' ? shape.remember('_selectHandler').nested : shape).removeClass(
+                            'cvat_canvas_hidden',
+                        );
+                    }
+
+                    if (text) {
+                        text.removeClass('cvat_canvas_hidden');
+                        this.updateTextPosition(text);
+                    }
+                }
+            }
+        }
+    }
+
+    private dispatchCanceledEvent(): void {
+        this.mode = Mode.IDLE;
+        const event: CustomEvent = new CustomEvent('canvas.canceled', {
+            bubbles: false,
+            cancelable: true,
+        });
+
+        this.canvas.dispatchEvent(event);
+    }
+
+    private restoreDrawHiddenObjects(): void {
+        const hiddenBecauseOfDraw = Object.keys(this.innerObjectsFlags.drawHidden)
+            .map((_clientID): number => +_clientID);
+        for (const clientID of hiddenBecauseOfDraw) {
+            this.setupInnerFlags(clientID, 'drawHidden', false);
+        }
+    }
+
+    private resetViewPosition(clientID: number): void {
+        const drawnState = this.drawnStates[clientID];
+        const drawnShape = this.svgShapes[clientID];
+
+        if (drawnState && drawnShape) {
+            const { shapeType, points } = drawnState;
+            const translatedPoints: number[] = this.translateToCanvas(points);
+            const stringified = stringifyPoints(translatedPoints);
+            if (shapeType === 'cuboid') {
+                drawnShape.attr('points', stringified);
+            } else if (['polygon', 'polyline', 'points'].includes(shapeType)) {
+                (drawnShape as SVG.PolyLine | SVG.Polygon).plot(stringified);
+                if (shapeType === 'points') {
+                    this.selectize(false, drawnShape);
+                    this.setupPoints(drawnShape as SVG.PolyLine, drawnState);
+                }
+            } else if (shapeType === 'rectangle') {
+                const [xtl, ytl, xbr, ybr] = translatedPoints;
+                drawnShape.rotate(0);
+                drawnShape.size(xbr - xtl, ybr - ytl).move(xtl, ytl);
+                drawnShape.rotate(drawnState.rotation);
+            } else if (shapeType === 'ellipse') {
+                const [cx, cy, rightX, topY] = translatedPoints;
+                const [rx, ry] = [rightX - cx, cy - topY];
+                drawnShape.rotate(0);
+                drawnShape.size(rx * 2, ry * 2).center(cx, cy);
+                drawnShape.rotate(drawnState.rotation);
+            } else if (shapeType === 'skeleton') {
+                drawnShape.rotate(0);
+                for (const child of (drawnShape as SVG.G).children()) {
+                    if (child.type === 'circle') {
+                        const childClientID = child.attr('data-client-id');
+                        const element = drawnState.elements.find((el: any) => el.clientID === childClientID);
+                        const [x, y] = this.translateToCanvas(element.points);
+                        child.center(x, y);
+                    }
+                }
+                drawnShape.rotate(drawnState.rotation);
+            } else if (shapeType === 'mask') {
+                const [left, top] = points.slice(-4);
+                drawnShape.move(this.geometry.offset + left, this.geometry.offset + top);
+            } else {
+                throw new Error('Not implemented');
+            }
+        }
+    }
+
+    private onInteraction = (
+        shapes: InteractionResult[] | null,
+        finished = false,
+        ctrlKey = false,
+    ): void => {
+        // whenever prompts are updated, interactor sends corresponding event with prompts
+        // when finished, it also sends finish flag equals to "true"
+        // when cancelled or closed, shapes equals to "null"
+        if (Array.isArray(shapes) || finished) {
+            const event: CustomEvent = new CustomEvent('canvas.interacted', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    finished,
+                    ctrlKey,
+                    shapes,
+                },
+            });
+
+            this.canvas.dispatchEvent(event);
+        }
+
+        if (shapes === null) {
+            this.dispatchCanceledEvent();
+        }
+    };
+
+    private onDrawDone = (
+        data: any | null,
+        duration: number,
+        continueDraw?: boolean,
+        prevDrawData?: DrawData,
+    ): void => {
+        this.restoreDrawHiddenObjects();
+
+        if (data) {
+            const { clientID, elements } = data as any;
+            const points = data.points || elements.map((el: any) => el.points).flat();
+            if (typeof clientID === 'number') {
+                const [state] = this.controller.objects
+                    .filter((_state: any): boolean => _state.clientID === clientID);
+
+                this.onEditDone(state, points, data.rotation);
+                this.dispatchCanceledEvent();
+                return;
+            }
+
+            const event: CustomEvent = new CustomEvent('canvas.drawn', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state: data,
+                    continue: continueDraw,
+                    simplifyPoly: data?.simplifyPoly || false,
+                    duration,
+                },
+            });
+
+            this.canvas.dispatchEvent(event);
+        } else if (!continueDraw) {
+            this.dispatchCanceledEvent();
+        }
+
+        if (continueDraw) {
+            this.canvas.dispatchEvent(
+                new CustomEvent('canvas.drawstart', {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: {
+                        drawData: prevDrawData,
+                    },
+                }),
+            );
+        } else {
+            // when draw stops from inside canvas (for example if use predefined number of points)
+            this.mode = Mode.IDLE;
+            this.canvas.style.cursor = '';
+        }
+    };
+
+    private onEditStart = (state?: any): void => {
+        this.canvas.style.cursor = 'crosshair';
+        this.deactivate();
+        this.canvas.dispatchEvent(
+            new CustomEvent('canvas.editstart', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                },
+            }),
+        );
+
+        if (state && state.shapeType === 'mask') {
+            this.setupInnerFlags(state.clientID, 'editHidden', true);
+        }
+
+        this.mode = Mode.EDIT;
+    };
+
+    // Mark a drawn state as edited so the diff logic redraws it during the next objects setup.
+    // (points is set to an empty array on purpose — see the note below.)
+    private markStateEdited(state: any): void {
+        // we need to store "updated" and set "points" to an empty array
+        // as this information is used to define "updated" objects in diff logic during canvas objects setup
+        // if because of any reason updating was actually rejected somewhere, we must reset view inside this logic
+
+        // there is one more deeper issue:
+        // somewhere canvas updates drawn views and then sends request,
+        // updating internal CVAT state (e.g. drag, resize)
+        // somewhere, however, it just sends request to update internal CVAT state
+        // (e.g. remove point, edit polygon/polyline)
+        // if object view was not changed by canvas and points accepted as is without any changes
+        // the view will not be updated during objects setup if we just set points as is here
+        // that is why we need to set points to an empty array (something that can't normally come from CVAT)
+        // I do not think it can be easily fixed now, however in the future we should refactor code
+        if (Number.isInteger(state.parentID)) {
+            const { elements } = this.drawnStates[state.parentID];
+            const drawnElement = elements.find((el) => el.clientID === state.clientID);
+            drawnElement.updated = 0;
+            drawnElement.points = [];
+
+            this.drawnStates[state.parentID].updated = 0;
+            this.drawnStates[state.parentID].points = [];
+        } else {
+            this.drawnStates[state.clientID].updated = 0;
+            this.drawnStates[state.clientID].points = [];
+        }
+    }
+
+    private onEditDone = (state: any, points: number[], rotation?: number): void => {
+        this.canvas.style.cursor = '';
+        this.mode = Mode.IDLE;
+        if (state && points) {
+            this.markStateEdited(state);
+
+            const event: CustomEvent = new CustomEvent('canvas.edited', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    points,
+                    rotation: typeof rotation === 'number' ? rotation : state.rotation,
+                },
+            });
+
+            this.canvas.dispatchEvent(event);
+        } else {
+            this.dispatchCanceledEvent();
+        }
+
+        for (const clientID of Object.keys(this.innerObjectsFlags.editHidden)) {
+            this.setupInnerFlags(+clientID, 'editHidden', false);
+        }
+    };
+
+    private onMergeDone = (objects: any[] | null, duration?: number): void => {
+        if (objects) {
+            const event: CustomEvent = new CustomEvent('canvas.merged', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    duration,
+                    states: objects,
+                },
+            });
+
+            this.mode = Mode.IDLE;
+            this.canvas.dispatchEvent(event);
+        } else {
+            this.dispatchCanceledEvent();
+        }
+    };
+
+    private onSplitDone = (object?: any, duration?: number): void => {
+        if (object && typeof duration !== 'undefined') {
+            const event: CustomEvent = new CustomEvent('canvas.splitted', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    duration,
+                    state: object,
+                    frame: object.frame,
+                },
+            });
+
+            this.canvas.style.cursor = '';
+            this.mode = Mode.IDLE;
+            this.splitHandler.split({ enabled: false });
+            this.canvas.dispatchEvent(event);
+        } else {
+            this.dispatchCanceledEvent();
+        }
+    };
+
+    private onSelectDone = (objects?: any[], duration?: number): void => {
+        if (this.mode === Mode.JOIN) {
+            this.onMessage(null);
+        }
+
+        if (objects && typeof duration !== 'undefined' && objects.length > 1) {
+            if (this.mode === Mode.GROUP) {
+                this.mode = Mode.IDLE;
+                this.canvas.dispatchEvent(new CustomEvent('canvas.grouped', {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: {
+                        duration,
+                        states: objects,
+                    },
+                }));
+            } else if (this.mode === Mode.JOIN) {
+                this.mode = Mode.IDLE;
+
+                const { shapeType } = objects[0];
+                if (shapeType === 'polygon') {
+                    this.joinPolygons(objects, duration);
+                } else if (shapeType === 'mask') {
+                    this.joinMasks(objects, duration);
+                }
+            }
+        } else {
+            this.dispatchCanceledEvent();
+        }
+    };
+
+    private onSelectObjectsDone = (objects?: any[], continueSelection = false): void => {
+        const emptyModifierSelection = this.selectionStartedWithModifier && !objects?.length;
+        const keepSelecting = continueSelection && !emptyModifierSelection;
+        this.selectionStartedWithModifier = false;
+        if (emptyModifierSelection) {
+            this.selectHandler.cancel(false);
+        }
+
+        if (!keepSelecting) {
+            this.mode = Mode.IDLE;
+            if (this.controller.selectData.enabled) {
+                this.controller.selectObjects({ enabled: false });
+            }
+        }
+        // Visual persistence of the selection is handled by the consumer.
+        // Emit an empty list too, so drawing an empty selection clears the old one.
+        this.canvas.dispatchEvent(new CustomEvent('canvas.selected', {
+            bubbles: false,
+            cancelable: true,
+            detail: {
+                states: objects || [],
+                continueSelection: keepSelecting,
+            },
+        }));
+    };
+
+    private joinPolygons(objects: any[], duration: number): void {
+        try {
+            const validObjects: any[] = [];
+            const selfIntersectingIndices: number[] = [];
+
+            objects.forEach((state, idx) => {
+                if (isPolygonSelfIntersecting(state.points)) {
+                    selfIntersectingIndices.push(idx);
+                } else {
+                    validObjects.push(state);
+                }
+            });
+
+            if (selfIntersectingIndices.length > 0) {
+                const excludedIds = selfIntersectingIndices.map((idx) => objects[idx].clientID).join(', ');
+                this.onWarning(
+                    `${selfIntersectingIndices.length} self-intersecting polygon${selfIntersectingIndices.length > 1 ? 's' : ''} excluded from merge ` +
+                    `(IDs: ${excludedIds}).`,
+                    'Join operation',
+                );
+            }
+
+            if (validObjects.length < 2) {
+                throw new Error('Cannot join: not enough valid polygons (need at least 2 non-self-intersecting polygons)');
+            }
+
+            // Convert CVAT polygon format to martinez format
+            // CVAT format: [x1, y1, x2, y2, ...] (flat array)
+            // martinez format: [[[x1, y1], [x2, y2], ...]] (GeoJSON Polygon)
+            const polygons: martinez.Polygon[] = validObjects.map((state) => {
+                const { points } = state;
+                const coords: martinez.Position[] = [];
+
+                for (let i = 0; i < points.length; i += 2) {
+                    coords.push([points[i], points[i + 1]]);
+                }
+
+                const firstPoint = coords[0];
+                const lastPoint = coords[coords.length - 1];
+                // Martinez library requires closed polygons (first point === last point)
+                // CVAT stores polygons in open format, so we need to close them
+                if (firstPoint[0] !== lastPoint[0] || firstPoint[1] !== lastPoint[1]) {
+                    coords.push([firstPoint[0], firstPoint[1]]);
+                }
+
+                return [coords];
+            });
+
+            let result: martinez.Geometry = polygons[0];
+            for (let i = 1; i < polygons.length; i += 1) {
+                result = martinez.union(result, polygons[i]);
+                if (!result) {
+                    throw new Error('Union operation failed - polygons may be invalid');
+                }
+            }
+
+            if (!result || result.length === 0) {
+                throw new Error('Union operation resulted in empty polygon');
+            }
+
+            validateUnionResult(result);
+
+            const processedResults = processPolygonUnionResult(result);
+
+            // Show warning if merge resulted in multiple disjoint polygons
+            if (processedResults.length > 1) {
+                this.onWarning(
+                    `Merge resulted in ${processedResults.length} separate polygons.`,
+                    'Join operation',
+                );
+            }
+
+            const pointsArray = processedResults.map(({ points }) => points);
+
+            this.canvas.dispatchEvent(new CustomEvent('canvas.joined', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    duration,
+                    states: validObjects,
+                    points: pointsArray,
+                    shapeType: 'polygon',
+                },
+            }));
+        } catch (error) {
+            this.onError(error);
+            this.dispatchCanceledEvent();
+        }
+    }
+
+    private joinMasks(objects: any[], duration: number): void {
+        let [left, top, right, bottom] = objects[0].points.slice(-4);
+        objects.forEach((state) => {
+            const [curLeft, curTop, curRight, curBottom] = state.points.slice(-4);
+            left = Math.min(left, curLeft);
+            top = Math.min(top, curTop);
+            right = Math.max(right, curRight);
+            bottom = Math.max(bottom, curBottom);
+        });
+
+        Promise.all(objects.map((state) => {
+            const [curLeft, , curRight] = state.points.slice(-4, -1);
+            const image = new ImageData(
+                RLEToImageData(255, 255, 255, state.points), curRight - curLeft + 1,
+            );
+            return createImageBitmap(image);
+        })).then((results) => {
+            const canvas = new OffscreenCanvas(right - left + 1, bottom - top + 1);
+            const ctx = canvas.getContext('2d');
+
+            results.forEach((bitmap, idx) => {
+                const [curLeft, curTop] = objects[idx].points.slice(-4, -2);
+                ctx.drawImage(bitmap, curLeft - left, curTop - top);
+                bitmap.close();
+            });
+
+            const imageData = ctx.getImageData(0, 0, right - left + 1, bottom - top + 1);
+            const rle = imageDataToRLE(imageData.data);
+            rle.push(left, top, right, bottom);
+
+            this.canvas.dispatchEvent(new CustomEvent('canvas.joined', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    duration,
+                    states: objects,
+                    points: [rle],
+                    shapeType: 'mask',
+                },
+            }));
+        }).catch((error) => {
+            this.onError(error);
+            this.dispatchCanceledEvent();
+        });
+    }
+
+    private onSliceDone = (state?: any, results?: number[][], duration?: number): void => {
+        if (state && results && typeof duration !== 'undefined') {
+            this.mode = Mode.IDLE;
+            this.sliceHandler.slice({ enabled: false });
+            this.canvas.dispatchEvent(new CustomEvent('canvas.sliced', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                    results,
+                    duration,
+                },
+            }));
+        } else {
+            this.dispatchCanceledEvent();
+        }
+    };
+
+    private onRegionSelected = (points?: number[]): void => {
+        if (points) {
+            this.canvas.dispatchEvent(new CustomEvent('canvas.regionselected', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    points,
+                },
+            }));
+        } else {
+            this.dispatchCanceledEvent();
+        }
+    };
+
+    private onFindObject = (e: MouseEvent): void => {
+        if (e.button === 0) {
+            const { offset } = this.controller.geometry;
+            const [x, y] = translateToSVG(this.content, [e.clientX, e.clientY]);
+            const event: CustomEvent = new CustomEvent(
+                this.mode === Mode.SELECT ? 'canvas.selectionrequested' : 'canvas.find',
+                {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: {
+                        x: x - offset,
+                        y: y - offset,
+                        states: this.controller.objects,
+                        mouseEvent: e,
+                    },
+                },
+            );
+
+            this.canvas.dispatchEvent(event);
+            e.preventDefault();
+        }
+    };
+
+    private onFocusRegion = (x: number, y: number, width: number, height: number): void => {
+        // First of all, compute and apply scale
+        let scale = null;
+
+        if ((this.geometry.angle / 90) % 2) {
+            // 90, 270, ..
+            scale = Math.min(
+                Math.max(
+                    Math.min(this.geometry.canvas.width / height, this.geometry.canvas.height / width),
+                    FrameZoom.MIN,
+                ),
+                FrameZoom.MAX,
+            );
+        } else {
+            scale = Math.min(
+                Math.max(
+                    Math.min(this.geometry.canvas.width / width, this.geometry.canvas.height / height),
+                    FrameZoom.MIN,
+                ),
+                FrameZoom.MAX,
+            );
+        }
+
+        this.geometry = { ...this.geometry, scale };
+        this.transformCanvas();
+
+        const [canvasX, canvasY] = translateFromSVG(this.content, [x + width / 2, y + height / 2]);
+
+        const canvasOffset = this.canvas.getBoundingClientRect();
+        const [cx, cy] = [
+            this.canvas.clientWidth / 2 + canvasOffset.left,
+            this.canvas.clientHeight / 2 + canvasOffset.top,
+        ];
+
+        const dragged = {
+            ...this.geometry,
+            top: this.geometry.top + cy - canvasY,
+            left: this.geometry.left + cx - canvasX,
+            scale,
+        };
+
+        this.controller.geometry = dragged;
+        this.geometry = dragged;
+        this.moveCanvas();
+
+        this.canvas.dispatchEvent(
+            new CustomEvent('canvas.zoom', {
+                bubbles: false,
+                cancelable: true,
+            }),
+        );
+    };
+
+    private moveCanvas(): void {
+        for (const obj of [this.background, this.grid, this.bitmap]) {
+            obj.style.top = `${this.geometry.top}px`;
+            obj.style.left = `${this.geometry.left}px`;
+        }
+
+        for (const obj of [this.content, this.text, this.attachmentBoard]) {
+            obj.style.top = `${this.geometry.top - this.geometry.offset}px`;
+            obj.style.left = `${this.geometry.left - this.geometry.offset}px`;
+        }
+
+        // Transform handlers
+        this.drawHandler.transform(this.geometry);
+        this.masksHandler.transform(this.geometry);
+        this.editHandler.transform(this.geometry);
+        this.zoomHandler.transform(this.geometry);
+        this.autoborderHandler.transform(this.geometry);
+        this.interactionHandler.transform(this.geometry);
+        this.regionSelector.transform(this.geometry);
+        this.objectSelector.transform(this.geometry);
+        this.sliceHandler.transform(this.geometry);
+        this.updateSelectedObjectsOverlay();
+    }
+
+    private transformCanvas(): void {
+        this.content.style.setProperty(
+            '--cvat-selection-stroke-width', `${(2 * consts.BASE_STROKE_WIDTH) / this.geometry.scale}`,
+        );
+        this.content.style.setProperty(
+            '--cvat-selection-point-stroke-width', `${consts.POINTS_SELECTED_STROKE_WIDTH / this.geometry.scale}`,
+        );
+
+        // Transform canvas
+        for (const obj of [
+            this.background,
+            this.grid,
+            this.content,
+            this.bitmap,
+            this.attachmentBoard,
+        ]) {
+            obj.style.transform = `scale(${this.geometry.scale}) rotate(${this.geometry.angle}deg)`;
+        }
+
+        // Transform grid
+        this.gridPath.setAttribute('stroke-width', `${consts.BASE_GRID_WIDTH / this.geometry.scale}px`);
+
+        // Transform all shape points
+        for (const element of [
+            ...window.document.getElementsByClassName('svg_select_points'),
+            ...window.document.getElementsByClassName('svg_select_points_rot'),
+            ...window.document.getElementsByClassName('svg_select_boundingRect'),
+        ]) {
+            element.setAttribute('stroke-width', `${consts.POINTS_STROKE_WIDTH / this.geometry.scale}`);
+            element.setAttribute('r', `${this.configuration.controlPointsSize / this.geometry.scale}`);
+        }
+
+        for (const element of window.document.getElementsByClassName('cvat_canvas_poly_direction')) {
+            const angle = (element as any).instance.data('angle');
+
+            (element as any).instance.style({
+                transform: `scale(${1 / this.geometry.scale}) rotate(${angle}deg)`,
+            });
+        }
+
+        for (const element of window.document.getElementsByClassName('cvat_canvas_selected_point')) {
+            const previousWidth = element.getAttribute('stroke-width') as string;
+            element.setAttribute('stroke-width', `${+previousWidth * 2}`);
+        }
+
+        // Transform all drawn shapes and text
+        for (const key of Object.keys(this.svgShapes)) {
+            const clientID = +key;
+            const object = this.svgShapes[clientID];
+            object.attr({
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+            });
+            if (object.type === 'circle') {
+                object.attr('r', `${this.configuration.controlPointsSize / this.geometry.scale}`);
+            }
+            if (clientID in this.svgTexts) {
+                this.updateTextPosition(this.svgTexts[clientID]);
+            }
+        }
+
+        // Transform skeleton edges
+        for (const skeletonEdge of window.document.getElementsByClassName('cvat_canvas_skeleton_edge')) {
+            skeletonEdge.setAttribute('stroke-width', `${consts.BASE_STROKE_WIDTH / this.geometry.scale}`);
+        }
+
+        // Transform all drawn issues region
+        for (const issueRegion of Object.values(this.drawnIssueRegions)) {
+            ((issueRegion as any) as SVG.Shape).attr('r', `${(consts.BASE_POINT_SIZE * 3) / this.geometry.scale}`);
+            ((issueRegion as any) as SVG.Shape).attr(
+                'stroke-width',
+                `${consts.BASE_STROKE_WIDTH / this.geometry.scale}`,
+            );
+        }
+
+        // Transform patterns
+        for (const pattern of [this.issueRegionPattern_1, this.issueRegionPattern_2]) {
+            pattern.attr({
+                width: consts.BASE_PATTERN_SIZE / this.geometry.scale,
+                height: consts.BASE_PATTERN_SIZE / this.geometry.scale,
+            });
+
+            pattern.children().forEach((element: SVG.Element): void => {
+                element.attr('stroke-width', consts.BASE_STROKE_WIDTH / this.geometry.scale);
+            });
+        }
+
+        // Transform handlers
+        this.drawHandler.transform(this.geometry);
+        this.masksHandler.transform(this.geometry);
+        this.editHandler.transform(this.geometry);
+        this.zoomHandler.transform(this.geometry);
+        this.autoborderHandler.transform(this.geometry);
+        this.interactionHandler.transform(this.geometry);
+        this.regionSelector.transform(this.geometry);
+
+        this.refreshRotationPointView();
+        this.refreshSkeletonResizer();
+        this.updateSelectedObjectsOverlay();
+    }
+
+    private resizeCanvas(): void {
+        for (const obj of [this.background, this.masksContent, this.grid, this.bitmap]) {
+            obj.style.width = `${this.geometry.image.width}px`;
+            obj.style.height = `${this.geometry.image.height}px`;
+        }
+
+        for (const obj of [this.content, this.text, this.attachmentBoard]) {
+            obj.style.width = `${this.geometry.image.width + this.geometry.offset * 2}px`;
+            obj.style.height = `${this.geometry.image.height + this.geometry.offset * 2}px`;
+        }
+    }
+
+    private setupIssueRegions(issueRegions: Record<number, { hidden: boolean; points: number[] }>): void {
+        for (const issueRegion of Object.keys(this.drawnIssueRegions)) {
+            if (!(issueRegion in issueRegions) || !+issueRegion) {
+                this.drawnIssueRegions[+issueRegion].remove();
+                delete this.drawnIssueRegions[+issueRegion];
+            }
+        }
+
+        for (const issueRegion of Object.keys(issueRegions)) {
+            if (issueRegion in this.drawnIssueRegions) continue;
+            const points = this.translateToCanvas(issueRegions[+issueRegion].points);
+            if (points.length === 2) {
+                this.drawnIssueRegions[+issueRegion] = this.adoptedContent
+                    .circle((consts.BASE_POINT_SIZE * 3 * 2) / this.geometry.scale)
+                    .center(points[0], points[1])
+                    .addClass('cvat_canvas_issue_region')
+                    .attr({
+                        id: `cvat_canvas_issue_region_${issueRegion}`,
+                        fill: 'url(#cvat_issue_region_pattern_1)',
+                    });
+            } else if (points.length === 4) {
+                const stringified = stringifyPoints([
+                    points[0],
+                    points[1],
+                    points[2],
+                    points[1],
+                    points[2],
+                    points[3],
+                    points[0],
+                    points[3],
+                ]);
+                this.drawnIssueRegions[+issueRegion] = this.adoptedContent
+                    .polygon(stringified)
+                    .addClass('cvat_canvas_issue_region')
+                    .attr({
+                        id: `cvat_canvas_issue_region_${issueRegion}`,
+                        fill: 'url(#cvat_issue_region_pattern_1)',
+                        'stroke-width': `${consts.BASE_STROKE_WIDTH / this.geometry.scale}`,
+                    });
+            } else {
+                const stringified = stringifyPoints(points);
+                this.drawnIssueRegions[+issueRegion] = this.adoptedContent
+                    .polygon(stringified)
+                    .addClass('cvat_canvas_issue_region')
+                    .attr({
+                        id: `cvat_canvas_issue_region_${issueRegion}`,
+                        fill: 'url(#cvat_issue_region_pattern_1)',
+                        'stroke-width': `${consts.BASE_STROKE_WIDTH / this.geometry.scale}`,
+                    });
+            }
+
+            if (issueRegions[+issueRegion].hidden) {
+                this.drawnIssueRegions[+issueRegion].style({ display: 'none' });
+            }
+        }
+    }
+
+    private getVisibleSkeletonElements(clientID: number): number[] | null {
+        const visibleElements = this.controller.renderData.visibleSkeletonElements[clientID];
+        return Array.isArray(visibleElements) ? [...visibleElements] : null;
+    }
+
+    private getVisibleSkeletonElementIDs(clientID: number): Set<number> | null {
+        const visibleElements = this.getVisibleSkeletonElements(clientID);
+        return visibleElements ? new Set(visibleElements) : null;
+    }
+
+    private skeletonElementsVisibilityChanged(state: any): boolean {
+        if (state.shapeType !== 'skeleton') {
+            return false;
+        }
+
+        const drawnVisibleElements = this.drawnStates[state.clientID].visibleSkeletonElements ?? null;
+        const visibleElements = this.getVisibleSkeletonElements(state.clientID);
+        return (
+            drawnVisibleElements?.length !== visibleElements?.length ||
+            (drawnVisibleElements || []).some((clientID, idx) => clientID !== visibleElements?.[idx])
+        );
+    }
+
+    private setupObjects(states: any[]): void {
+        const created = [];
+        const updated = [];
+
+        for (const state of states) {
+            if (!(state.clientID in this.drawnStates)) {
+                created.push(state);
+            } else {
+                const drawnState = this.drawnStates[state.clientID];
+                // object has been changed or changed frame for a track
+                if (
+                    drawnState.updated !== state.updated ||
+                    drawnState.frame !== state.frame ||
+                    this.skeletonElementsVisibilityChanged(state)
+                ) {
+                    updated.push(state);
+                }
+            }
+        }
+        const newIDs = states.map((state: any): number => state.clientID);
+        const deleted = Object.keys(this.drawnStates)
+            .map((clientID: string): number => +clientID)
+            .filter((id: number): boolean => !newIDs.includes(id))
+            .map((id: number): any => this.drawnStates[id]);
+
+        if (deleted.length || updated.length || created.length) {
+            if (this.activeElement.clientID !== null) {
+                this.deactivate();
+            }
+
+            this.deleteObjects(deleted);
+            this.addObjects(created);
+
+            const updatedSkeletons = updated.filter((state: any): boolean => state.shapeType === 'skeleton');
+            const updatedNotSkeletons = updated.filter((state: any): boolean => state.shapeType !== 'skeleton');
+            // todo: implement updateObjects for skeletons, add group and color to updateObjects function
+            // change colors if necessary (for example when instance color is changed)
+            this.updateObjects(updatedNotSkeletons);
+
+            this.deleteObjects(updatedSkeletons);
+            this.addObjects(updatedSkeletons);
+
+            this.sortObjects();
+
+            if (this.controller.activeElement.clientID !== null) {
+                const { clientID } = this.controller.activeElement;
+                if (states.map((state: any): number => state.clientID).includes(clientID)) {
+                    this.activate(this.controller.activeElement);
+                }
+            }
+
+            this.autoborderHandler.updateObjects();
+        }
+    }
+
+    private hideDirection(shape: SVG.Polygon | SVG.PolyLine): void {
+        /* eslint class-methods-use-this: 0 */
+        const handler = shape.remember('_selectHandler');
+        if (!handler || !handler.nested) return;
+        const nested = handler.nested as SVG.Parent;
+        if (nested.children().length) {
+            nested.children()[0].removeClass('cvat_canvas_first_poly_point');
+        }
+
+        const node = nested.node as SVG.LinkedHTMLElement;
+        const directions = node.getElementsByClassName('cvat_canvas_poly_direction');
+        for (const direction of directions) {
+            const { instance } = direction as any;
+            instance.off('click');
+            instance.remove();
+        }
+    }
+
+    private showDirection(state: any, shape: SVG.Polygon | SVG.PolyLine): void {
+        const path = consts.ARROW_PATH;
+
+        const points = parsePoints(state.points);
+        const handler = shape.remember('_selectHandler');
+
+        if (!handler || !handler.nested) return;
+        const firstCircle = handler.nested.children()[0];
+        const secondCircle = handler.nested.children()[1];
+        firstCircle.addClass('cvat_canvas_first_poly_point');
+
+        const [cx, cy] = [(secondCircle.cx() + firstCircle.cx()) / 2, (secondCircle.cy() + firstCircle.cy()) / 2];
+        const [firstPoint, secondPoint] = points.slice(0, 2);
+        const xAxis = { i: 1, j: 0 };
+        const baseVector = { i: secondPoint.x - firstPoint.x, j: secondPoint.y - firstPoint.y };
+        const baseVectorLength = vectorLength(baseVector);
+        let cosinus = 0;
+
+        if (baseVectorLength !== 0) {
+            // two points have the same coordinates
+            cosinus = scalarProduct(xAxis, baseVector) / (vectorLength(xAxis) * baseVectorLength);
+        }
+        const angle = (Math.acos(cosinus) * (Math.sign(baseVector.j) || 1) * 180) / Math.PI;
+
+        const pathElement = handler.nested
+            .path(path)
+            .fill('white')
+            .stroke({
+                width: 1,
+                color: 'black',
+            })
+            .addClass('cvat_canvas_poly_direction')
+            .style({
+                'transform-origin': `${cx}px ${cy}px`,
+                transform: `scale(${1 / this.geometry.scale}) rotate(${angle}deg)`,
+            })
+            .move(cx, cy);
+
+        pathElement.on('click', (e: MouseEvent): void => {
+            if (e.button === 0) {
+                e.stopPropagation();
+                if (state.shapeType === 'polygon') {
+                    const reversedPoints = [points[0], ...points.slice(1).reverse()];
+                    this.onEditDone(state, pointsToNumberArray(reversedPoints));
+                } else {
+                    const reversedPoints = points.reverse();
+                    this.onEditDone(state, pointsToNumberArray(reversedPoints));
+                }
+            }
+        });
+
+        pathElement.data('angle', angle);
+        pathElement.dmove(-pathElement.width() / 2, -pathElement.height() / 2);
+    }
+
+    private static getSkeletonResizerHandle(point: SVG.Element): string | null {
+        const handles = ['lt', 'rt', 'rb', 'lb', 't', 'r', 'b', 'l'];
+        return handles.find((handle: string): boolean => point.hasClass(`svg_select_points_${handle}`)) ?? null;
+    }
+
+    private screenToCanvasSize(size: number): number {
+        return size / this.geometry.scale;
+    }
+
+    private updateSkeletonResizerView(element: Element, hovered: boolean): void {
+        const isOuterStroke = element.classList.contains('cvat_canvas_skeleton_resizer_outer');
+        const strokeWidth =
+            isOuterStroke && hovered ? consts.POINTS_SELECTED_STROKE_WIDTH : 2 * consts.POINTS_STROKE_WIDTH;
+
+        element.classList.toggle('cvat_canvas_skeleton_resizer_hovered', hovered);
+        element.setAttribute('stroke-opacity', hovered ? '1' : '0.8');
+        element.setAttribute(
+            'stroke-width',
+            `${this.screenToCanvasSize(strokeWidth)}`,
+        );
+    }
+
+    private toggleSkeletonResizer(point: SVG.Element, hovered: boolean): void {
+        const handle = CanvasViewImpl.getSkeletonResizerHandle(point);
+        if (!handle) {
+            return;
+        }
+
+        const parent = point.node.parentElement;
+        if (!parent) {
+            return;
+        }
+
+        for (const resizer of parent.getElementsByClassName(
+            `cvat_canvas_skeleton_resizer_${handle}`,
+        )) {
+            this.updateSkeletonResizerView(resizer, hovered);
+        }
+    }
+
+    private setupSkeletonResizer(container: SVG.Container): void {
+        const boundingRect = container.children().find((element: SVG.Element): boolean => (
+            element.hasClass('svg_select_boundingRect')
+        ));
+        if (!boundingRect) {
+            return;
+        }
+
+        const strokeWidth = this.screenToCanvasSize(consts.POINTS_STROKE_WIDTH);
+        const controlPointRadius = this.screenToCanvasSize(this.configuration.controlPointsSize);
+        const controlPointDiameter = 2 * controlPointRadius;
+        // For tiny BBs use controlPoint diameter as base for calculations
+        const boundingRectWidth = Math.max(boundingRect.width(), controlPointDiameter);
+        const boundingRectHeight = Math.max(boundingRect.height(), controlPointDiameter);
+        // we don't want it to be smaller than 3x width of the stroke we're using so it's a minimum size
+        // we aim towards 1.7 of the controlPoint (hitbox) but we don't want resizers to cover
+        // full width or full height so we limit their size with width/3 or height/3
+        // so they take up to 2/3 of the size length max
+        const cornerLength = Math.max(
+            strokeWidth * 3,
+            Math.min(controlPointRadius * 1.7, boundingRectWidth / 4, boundingRectHeight / 4),
+        );
+        // similar idea but we aim side segment to be a bit longer than corner segment
+        const segmentLength = Math.max(
+            strokeWidth * 4,
+            Math.min(controlPointRadius * 2.2, boundingRectWidth / 3, boundingRectHeight / 3),
+        );
+        const innerStrokeOffset = this.screenToCanvasSize(2 * consts.POINTS_STROKE_WIDTH);
+
+        const resizerPath = (handle: string, cx: number, cy: number, inset = 0): string => {
+            switch (handle) {
+                case 'lt':
+                    return `M ${cx + inset} ${cy + cornerLength}
+                            L ${cx + inset} ${cy + inset}
+                            L ${cx + cornerLength} ${cy + inset}`;
+                case 'rt':
+                    return `M ${cx - cornerLength} ${cy + inset}
+                            L ${cx - inset} ${cy + inset}
+                            L ${cx - inset} ${cy + cornerLength}`;
+                case 'rb':
+                    return `M ${cx - inset} ${cy - cornerLength}
+                            L ${cx - inset} ${cy - inset}
+                            L ${cx - cornerLength} ${cy - inset}`;
+                case 'lb':
+                    return `M ${cx + cornerLength} ${cy - inset}
+                            L ${cx + inset} ${cy - inset}
+                            L ${cx + inset} ${cy - cornerLength}`;
+                case 't':
+                    return `M ${cx - segmentLength / 2} ${cy + inset}
+                            L ${cx + segmentLength / 2} ${cy + inset}`;
+                case 'b':
+                    return `M ${cx - segmentLength / 2} ${cy - inset}
+                            L ${cx + segmentLength / 2} ${cy - inset}`;
+                case 'r':
+                    return `M ${cx - inset} ${cy - segmentLength / 2}
+                            L ${cx - inset} ${cy + segmentLength / 2}`;
+                case 'l':
+                    return `M ${cx + inset} ${cy - segmentLength / 2}
+                            L ${cx + inset} ${cy + segmentLength / 2}`;
+                default:
+                    return '';
+            }
+        };
+
+        // clean previous resizers
+        for (const resizer of Array.from(
+            container.node.getElementsByClassName('cvat_canvas_skeleton_resizer'),
+        )) {
+            resizer.parentNode?.removeChild(resizer);
+        }
+
+        const controlPoints = container.children().filter((point: SVG.Element): boolean => (
+            point.type === 'circle' &&
+            (point.hasClass('svg_select_points') || point.hasClass('svg_select_points_rot'))
+        ));
+
+        // ensure control points attrs and create a fresh resizer
+        for (const point of controlPoints) {
+            const isRotationPoint = point.hasClass('svg_select_points_rot');
+            // we keep control points other than the rotation point invisible as hitboxes
+            // and they define resizer positions.
+            // we do not replace them with resizers directly because svg.select manages
+            // these controls as circles positioning their center and using radius
+            // passing non-round resizers directly causes weird calculations and requires ugly code
+            if (!point.hasClass('cvat_canvas_skeleton_control_point')) {
+                point
+                    .addClass('cvat_canvas_skeleton_control_point')
+                    .attr({
+                        fill: 'white',
+                        'fill-opacity': isRotationPoint ? 1 : 0,
+                        stroke: 'black',
+                        'stroke-opacity': isRotationPoint ? 1 : 0,
+                        'pointer-events': 'all',
+                    });
+            }
+
+            point.attr({
+                'stroke-width': strokeWidth,
+                r: controlPointRadius,
+            });
+
+            if (isRotationPoint) {
+                continue;
+            }
+
+            const handle = CanvasViewImpl.getSkeletonResizerHandle(point);
+            if (!handle) {
+                continue;
+            }
+
+            const isHovered = point.hasClass('cvat_canvas_selected_point');
+            const outerPath = resizerPath(handle, point.cx(), point.cy());
+            const innerPath = resizerPath(handle, point.cx(), point.cy(), innerStrokeOffset);
+            const outerResizer = container
+                .path(outerPath)
+                .addClass('cvat_canvas_skeleton_resizer')
+                .addClass('cvat_canvas_skeleton_resizer_outer')
+                .addClass(`cvat_canvas_skeleton_resizer_${handle}`)
+                .attr({
+                    fill: 'none',
+                    stroke: 'black',
+                    'pointer-events': 'none',
+                });
+            const innerResizer = container
+                .path(innerPath)
+                .addClass('cvat_canvas_skeleton_resizer')
+                .addClass('cvat_canvas_skeleton_resizer_inner')
+                .addClass(`cvat_canvas_skeleton_resizer_${handle}`)
+                .attr({
+                    fill: 'none',
+                    stroke: 'white',
+                    'pointer-events': 'none',
+                });
+
+            this.updateSkeletonResizerView(outerResizer.node, isHovered);
+            this.updateSkeletonResizerView(innerResizer.node, isHovered);
+        }
+    }
+
+    private refreshSkeletonResizer(): void {
+        const { clientID } = this.activeElement;
+        if (clientID === null || this.drawnStates[clientID]?.shapeType !== 'skeleton') {
+            return;
+        }
+
+        const skeleton = this.svgShapes[clientID] as SVG.G;
+        const wrappingRect = skeleton.children().find((child: SVG.Element): boolean => (
+            child.hasClass('cvat_canvas_skeleton_wrapping_rect')
+        ));
+        const selectContainer = wrappingRect?.remember('_selectHandler')?.nested as SVG.Container | undefined;
+        if (!selectContainer) {
+            return;
+        }
+
+        this.setupSkeletonResizer(selectContainer);
+    }
+
+    private scheduleSkeletonResizerRefresh(): void {
+        if (this.skeletonResizerRefreshRequest !== null) {
+            return;
+        }
+
+        // we need to delay the refresh to the next frame during resize as otherwise
+        // select handles are not yet updated if handled synchronously
+        // also, potentially batches swift resize updates so its not recalculated multiple times per frame
+        this.skeletonResizerRefreshRequest = window.requestAnimationFrame((): void => {
+            this.skeletonResizerRefreshRequest = null;
+            this.refreshSkeletonResizer();
+        });
+    }
+
+    private refreshRotationPointView(): void {
+        // there can be only one selection on canvas so we handle first element only
+        const [rotationPoint] = window.document.getElementsByClassName('svg_select_points_rot');
+        const [topPoint] = window.document.getElementsByClassName('svg_select_points_t');
+        if (!rotationPoint) {
+            return;
+        }
+
+        if (topPoint) {
+            const rotY = +rotationPoint.getAttribute('cy');
+            const topY = +topPoint.getAttribute('cy');
+            const rotationPointOffset = this.screenToCanvasSize(2 * this.configuration.controlPointsSize + 5);
+            (rotationPoint as SVGElement).style.transform =
+                `translate(0px, -${rotY - topY + rotationPointOffset}px)`;
+        }
+
+        if (!rotationPoint.children.length) {
+            const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+            title.textContent = 'Hold Shift to snap angle';
+            rotationPoint.appendChild(title);
+        }
+    }
+
+    private selectize(value: boolean, shape: SVG.Element): void {
+        const isSkeletonRect = shape.hasClass('cvat_canvas_skeleton_wrapping_rect');
+        const mousedownHandler = (e: MouseEvent): void => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+
+            if (this.activeElement.clientID !== null) {
+                const pointID = Array.prototype.indexOf.call(
+                    ((e.target as HTMLElement).parentElement as HTMLElement).children,
+                    e.target,
+                );
+                const [state] = this.controller.objects.filter(
+                    (_state: any): boolean => _state.clientID === this.activeElement.clientID,
+                );
+
+                if (['polygon', 'polyline', 'points'].includes(state.shapeType)) {
+                    if (state.shapeType === 'points' && (e.altKey || e.ctrlKey)) {
+                        const selectedClientID = +((e.target as HTMLElement).parentElement as HTMLElement).getAttribute('clientID');
+
+                        if (state.clientID !== selectedClientID) {
+                            return;
+                        }
+                    }
+                    if (e.altKey) {
+                        const { points } = state;
+                        if (
+                            (state.shapeType === 'polygon' && state.points.length > 6) ||
+                            (state.shapeType === 'polyline' && state.points.length > 4) ||
+                            (state.shapeType === 'points' && state.points.length > 2)
+                        ) {
+                            this.onEditDone(state, points.slice(0, pointID * 2).concat(points.slice(pointID * 2 + 2)));
+                        }
+                    } else if (e.shiftKey) {
+                        this.onEditStart(state);
+                        this.editHandler.edit({
+                            enabled: true,
+                            state,
+                            pointID,
+                        });
+                    }
+                }
+            }
+        };
+
+        const dblClickHandler = (e: MouseEvent): void => {
+            if (this.activeElement.clientID !== null) {
+                const [state] = this.controller.objects.filter(
+                    (_state: any): boolean => _state.clientID === this.activeElement.clientID,
+                );
+
+                if (state.shapeType === 'cuboid') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (e.shiftKey) {
+                        const points = this.translateFromCanvas(
+                            pointsToNumberArray((e.target as any).parentElement.parentElement.instance.attr('points')),
+                        );
+                        this.onEditDone(state, points);
+                    }
+                }
+            }
+        };
+
+        const contextMenuHandler = (e: MouseEvent): void => {
+            // Preserve vertex menus for polygons, polylines, and points (rendered as SVG polylines).
+            // Other shapes' resize and rotation handles should not open context menus.
+            if (!['polygon', 'polyline'].includes(shape.type)) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+
+            const pointID = Array.prototype.indexOf.call(
+                ((e.target as HTMLElement).parentElement as HTMLElement).children,
+                e.target,
+            );
+            if (this.activeElement.clientID !== null) {
+                const [state] = this.controller.objects.filter(
+                    (_state: any): boolean => _state.clientID === this.activeElement.clientID,
+                );
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.contextmenu', {
+                        bubbles: false,
+                        cancelable: true,
+                        detail: {
+                            mouseEvent: e,
+                            objectState: state,
+                            pointID,
+                        },
+                    }),
+                );
+            }
+            e.preventDefault();
+        };
+
+        if (value) {
+            const getGeometry = (): Geometry => this.geometry;
+            const getController = (): CanvasController => this.controller;
+            const getActiveElement = (): ActiveElement => this.activeElement;
+            const toggleSkeletonResizer = (point: SVG.Element, hovered: boolean): void => {
+                if (!isSkeletonRect) {
+                    return;
+                }
+
+                this.toggleSkeletonResizer(point, hovered);
+            };
+            (shape as any).selectize(value, {
+                deepSelect: true,
+                pointSize: (2 * this.configuration.controlPointsSize) / this.geometry.scale,
+                rotationPoint: shape.type === 'rect' || shape.type === 'ellipse',
+                pointsExclude: shape.type === 'image' ? ['lt', 'rt', 'rb', 'lb', 't', 'r', 'b', 'l'] : [],
+                pointType(cx: number, cy: number): SVG.Circle {
+                    const circle: SVG.Circle = this.nested
+                        .circle(this.options.pointSize)
+                        .stroke('black')
+                        .fill('inherit')
+                        .center(cx, cy)
+                        .attr({
+                            'fill-opacity': 1,
+                            'stroke-width': consts.POINTS_STROKE_WIDTH / getGeometry().scale,
+                        });
+
+                    circle.on('mouseenter', (e: MouseEvent): void => {
+                        const activeElement = getActiveElement();
+                        if (activeElement !== null && (e.altKey || e.ctrlKey)) {
+                            const [state] = getController().objects.filter(
+                                (_state: any): boolean => _state.clientID === activeElement.clientID,
+                            );
+                            if (state?.shapeType === 'points') {
+                                const selectedClientID = +((e.target as HTMLElement).parentElement as HTMLElement).getAttribute('clientID');
+                                if (state.clientID !== selectedClientID) {
+                                    return;
+                                }
+                            }
+                        }
+
+                        circle.attr({
+                            'stroke-width': consts.POINTS_SELECTED_STROKE_WIDTH / getGeometry().scale,
+                        });
+
+                        circle.on('dblclick', dblClickHandler);
+                        circle.on('mousedown', mousedownHandler);
+                        circle.on('contextmenu', contextMenuHandler);
+                        circle.addClass('cvat_canvas_selected_point');
+                        toggleSkeletonResizer(circle, true);
+                    });
+
+                    circle.on('mouseleave', (): void => {
+                        circle.attr({
+                            'stroke-width': consts.POINTS_STROKE_WIDTH / getGeometry().scale,
+                        });
+
+                        circle.off('dblclick', dblClickHandler);
+                        circle.off('mousedown', mousedownHandler);
+                        circle.off('contextmenu', contextMenuHandler);
+                        circle.removeClass('cvat_canvas_selected_point');
+                        toggleSkeletonResizer(circle, false);
+                    });
+                    return circle;
+                },
+            });
+        } else {
+            (shape as any).selectize(false, {
+                deepSelect: true,
+            });
+        }
+
+        const handler = shape.remember('_selectHandler');
+        if (handler && handler.nested) {
+            handler.nested.fill(shape.attr('fill'));
+            if (value && isSkeletonRect) {
+                this.setupSkeletonResizer(handler.nested);
+            }
+        }
+
+        this.refreshRotationPointView();
+
+        if (value && shape.type === 'image') {
+            const [boundingRect] = window.document.getElementsByClassName('svg_select_boundingRect');
+            if (boundingRect) {
+                (boundingRect as SVGRectElement).style.opacity = '1';
+                boundingRect.setAttribute('fill', 'none');
+                boundingRect.setAttribute('stroke', shape.attr('stroke'));
+                boundingRect.setAttribute('stroke-width', `${consts.BASE_STROKE_WIDTH / this.geometry.scale}px`);
+                if (shape.hasClass('cvat_canvas_shape_occluded')) {
+                    boundingRect.setAttribute('stroke-dasharray', '5');
+                }
+            }
+        }
+    }
+
+    private draggable(
+        state: any,
+        shape: SVG.Shape,
+        onDragStart: () => void = () => {},
+        onDragMove: () => void = () => {},
+        onDragEnd: () => void = () => {},
+    ): void {
+        let draggableInstance = shape;
+        if (shape.classes().includes('cvat_canvas_shape_skeleton')) {
+            // for skeletons we use wrapping rectangle to drag the skeleton itself
+            draggableInstance = (shape as any).children().find((child: SVG.Element) => child.type === 'rect');
+        }
+
+        if (state) {
+            let start = Date.now();
+            let aborted = false;
+            let skeletonSVGTemplate: SVG.G = null;
+            shape.addClass('cvat_canvas_shape_draggable');
+            (draggableInstance as any).draggable({
+                ...(state.shapeType === 'mask' ? { snapToGrid: 1 } : {}),
+            });
+
+            let startCenter = null;
+            // live multi-selection drag: when a selected shape is dragged, the rest of the
+            // selection follows by the same delta
+            let groupDragging = false;
+            let groupSiblingIDs: number[] = [];
+            let groupStates: any[] = [];
+            let groupPreviewShapes: SelectionPreviewShape[] = [];
+            let groupStartPointer: { x: number; y: number } | null = null;
+            let groupPointerMatrix: SVG.Matrix | null = null;
+            let groupOffset = { x: 0, y: 0 };
+            let groupIncludesMask = false;
+            draggableInstance.on('dragstart', (event: CustomEvent): void => {
+                aborted = false;
+                onDragStart();
+                this.draggableShape = shape;
+                const { cx, cy } = shape.bbox();
+                startCenter = { x: cx, y: cy };
+                groupDragging = this.selectedObjects.length > 1 &&
+                    this.selectedObjectsSet.has(state.clientID) && this.isStateMovableInSelection(state);
+                groupStates = groupDragging ? this.getMovableSelectedStates() : [];
+                groupSiblingIDs = groupStates.filter((member) => member.clientID !== state.clientID)
+                    .map((member) => member.clientID);
+                groupPreviewShapes = this.prepareSelectionPreviewShapes(groupStates);
+                groupIncludesMask = groupStates.some((member) => member.shapeType === 'mask');
+                groupOffset = { x: 0, y: 0 };
+                start = Date.now();
+                if (this.selectedObjectsSet.has(state.clientID)) {
+                    this.closeSelectedObjectsMenu();
+                }
+                if (groupDragging) {
+                    const sourceEvent = event.detail.event as MouseEvent | TouchEvent;
+                    const pointer = 'changedTouches' in sourceEvent ? sourceEvent.changedTouches[0] : sourceEvent;
+                    groupStartPointer = { x: pointer.clientX, y: pointer.clientY };
+                    groupPointerMatrix = this.adoptedContent.screenCTM().inverse();
+                    this.setSelectedObjectsOverlayDragging(true);
+                    this.cancelSelectionDrag = (): void => {
+                        this.cancelSelectionDrag = null;
+                        draggableInstance.fire('dragabort');
+                    };
+                }
+            }).on('dragmove', (e: CustomEvent): void => {
+                if (groupDragging && groupStartPointer && groupPointerMatrix) {
+                    e.preventDefault();
+                    if (aborted) return;
+                    // SVG.js recalculates the dragged element's CTM on each event.
+                    // Use screen deltas so the temporary preview transform cannot change the drag anchor.
+                    const sourceEvent = e.detail.event as MouseEvent | TouchEvent;
+                    const pointer = 'changedTouches' in sourceEvent ? sourceEvent.changedTouches[0] : sourceEvent;
+                    const localDx = pointer.clientX - groupStartPointer.x;
+                    const localDy = pointer.clientY - groupStartPointer.y;
+                    const offset = {
+                        x: groupPointerMatrix.a * localDx + groupPointerMatrix.c * localDy,
+                        y: groupPointerMatrix.b * localDx + groupPointerMatrix.d * localDy,
+                    };
+                    this.scheduleSelectionPreview(() => {
+                        const dx = offset.x - groupOffset.x;
+                        const dy = offset.y - groupOffset.y;
+                        if (!dx && !dy) return;
+                        this.moveSelectionPreviewShapes(groupPreviewShapes, offset.x, offset.y);
+                        groupOffset = offset;
+                        onDragMove();
+                    });
+                    return;
+                }
+                onDragMove();
+                if (state.shapeType === 'skeleton' && e.target) {
+                    const { instance } = e.target as any;
+                    const [x, y] = [instance.x(), instance.y()];
+                    const prevXtl = +draggableInstance.attr('data-xtl');
+                    const prevYtl = +draggableInstance.attr('data-ytl');
+
+                    for (const child of (shape as SVG.G).children()) {
+                        if (child.type === 'circle') {
+                            const childClientID = child.attr('data-client-id');
+                            if (state.elements.find((el: any) => el.clientID === childClientID).lock || false) {
+                                continue;
+                            }
+                            child.center(child.cx() - prevXtl + x, child.cy() - prevYtl + y);
+                        }
+                    }
+
+                    draggableInstance.attr('data-xtl', x);
+                    draggableInstance.attr('data-ytl', y);
+                    draggableInstance.attr('data-xbr', x + instance.width());
+                    draggableInstance.attr('data-ybr', y + instance.height());
+
+                    skeletonSVGTemplate = skeletonSVGTemplate ?? makeSVGFromTemplate(state.label.structure.svg);
+                    setupSkeletonEdges(shape as SVG.G, skeletonSVGTemplate);
+                }
+            }).on('dragend', (): void => {
+                if (groupDragging) {
+                    this.cancelSelectionDrag = null;
+                    if (aborted) this.cancelSelectionPreview();
+                    else this.flushSelectionPreview();
+                    const { dx, dy } = this.normalizeSelectionTranslation(
+                        groupIncludesMask, groupOffset.x, groupOffset.y,
+                    );
+                    this.finishSelectionPreviewShapes(groupPreviewShapes, aborted ? 0 : dx, aborted ? 0 : dy);
+                    groupPreviewShapes = [];
+                    groupOffset = { x: dx, y: dy };
+                }
+                if (aborted) {
+                    this.resetViewPosition(state.clientID);
+                    for (const siblingID of groupSiblingIDs) {
+                        this.resetViewPosition(siblingID);
+                    }
+                    this.setSelectedObjectsOverlayDragging(false);
+                    this.updateSelectedObjectsOverlay();
+                    return;
+                }
+
+                onDragEnd();
+                this.draggableShape = null;
+                let hasMoved = groupDragging && (groupOffset.x !== 0 || groupOffset.y !== 0);
+                if (!groupDragging) {
+                    const { cx, cy } = shape.bbox();
+                    const dx2 = (startCenter.x - cx) ** 2;
+                    const dy2 = (startCenter.y - cy) ** 2;
+                    hasMoved = Math.sqrt(dx2 + dy2) > 0;
+                }
+
+                if (hasMoved) {
+                    if (groupDragging) {
+                        // Move all editable members together and record them as a single change.
+                        const movedStates = groupStates.map((movedState: any) => ({
+                            state: movedState,
+                            points: this.translateStatePoints(movedState, groupOffset.x, groupOffset.y),
+                        }));
+
+                        movedStates.forEach(({ state: movedState }) => this.markStateEdited(movedState));
+                        this.canvas.style.cursor = '';
+                        this.mode = Mode.IDLE;
+                        this.canvas.dispatchEvent(
+                            new CustomEvent('canvas.groupmoved', {
+                                bubbles: false,
+                                cancelable: true,
+                                detail: {
+                                    states: movedStates,
+                                    duration: Date.now() - start,
+                                },
+                            }),
+                        );
+                    } else {
+                        let draggedPoints: number[];
+                        if (state.shapeType === 'mask') {
+                            const points = [...state.points];
+                            const x = Math.trunc(shape.x()) - this.geometry.offset;
+                            const y = Math.trunc(shape.y()) - this.geometry.offset;
+                            points.splice(-4);
+                            points.push(x, y, x + shape.width() - 1, y + shape.height() - 1);
+                            draggedPoints = points;
+                        } else if (state.shapeType === 'skeleton') {
+                            const points = [];
+                            state.elements.forEach((element: any) => {
+                                const elementShape = (shape as SVG.G).children()
+                                    .find((child: SVG.Shape) => (
+                                        child.id() === `cvat_canvas_shape_${element.clientID}`
+                                    ));
+
+                                if (elementShape) {
+                                    points.push(...this.translateFromCanvas(readPointsFromShape(elementShape)));
+                                }
+                            });
+                            draggedPoints = points;
+                        } else {
+                            // these points does not take into account possible transformations, applied on the element
+                            // so, if any (like rotation) we need to map them to canvas coordinate space
+                            let points = readPointsFromShape(shape);
+                            const { rotation } = shape.transform();
+                            if (rotation) {
+                                points = this.translatePointsFromRotatedShape(shape, points);
+                            }
+
+                            draggedPoints = this.translateFromCanvas(points);
+                        }
+
+                        this.onEditDone(state, draggedPoints);
+                    }
+
+                    this.canvas.dispatchEvent(
+                        new CustomEvent('canvas.dragshape', {
+                            bubbles: false,
+                            cancelable: true,
+                            detail: {
+                                state,
+                                duration: Date.now() - start,
+                            },
+                        }),
+                    );
+                }
+                if (groupDragging) {
+                    this.setSelectedObjectsOverlayDragging(false);
+                    this.updateSelectedObjectsOverlay();
+                }
+            }).on('dragabort', (): void => {
+                if (groupDragging) {
+                    this.cancelSelectionPreview();
+                    this.finishSelectionPreviewShapes(groupPreviewShapes);
+                    groupPreviewShapes = [];
+                }
+                onDragEnd();
+                this.setSelectedObjectsOverlayDragging(false);
+                this.draggableShape = null;
+                aborted = true;
+                // disable internal drag events of SVG.js
+                // call chain is (mouseup -> SVG.handler.end -> SVG.handler.drag -> dragend)
+                window.dispatchEvent(new MouseEvent('mouseup'));
+            });
+        } else {
+            shape.removeClass('cvat_canvas_shape_draggable');
+
+            if (this.draggableShape === shape) {
+                draggableInstance.fire('dragabort');
+            }
+
+            draggableInstance.off('dragstart');
+            draggableInstance.off('dragmove');
+            draggableInstance.off('dragend');
+            draggableInstance.off('dragabort');
+            (draggableInstance as any).draggable(false);
+        }
+    }
+
+    private resizable(
+        state: any,
+        shape: SVG.Shape,
+        onResizeStart: () => void = () => {},
+        onResizing: () => void = () => {},
+        onResizeEnd: () => void = () => {},
+    ): void {
+        let resizableInstance = shape;
+        let skeletonSVGTemplate: SVG.G = null;
+
+        if (shape.classes().includes('cvat_canvas_shape_skeleton')) {
+            // for skeletons we use wrapping rectangle to resize the skeleton itself
+            resizableInstance = (shape as any).children().find((child: SVG.Element) => child.type === 'rect');
+
+            const circles = (shape as any).children().filter((child: SVG.Element) => child.type === 'circle');
+            const svgElements = Object.fromEntries(circles.map((circle: SVG.Circle) => [circle.attr('data-client-id'), circle]));
+
+            Object.entries(svgElements).forEach(([key, element]) => {
+                if (state) {
+                    const clientID = +key;
+                    const elementState = state.elements
+                        .find((_element: any) => _element.clientID === clientID);
+                    const text = this.svgTexts[clientID];
+                    const hideElementText = (): void => {
+                        if (text) {
+                            text.addClass('cvat_canvas_hidden');
+                        }
+                    };
+
+                    const showElementText = (): void => {
+                        if (text) {
+                            text.removeClass('cvat_canvas_hidden');
+                            this.updateTextPosition(text);
+                        }
+                    };
+
+                    if (!elementState.lock) {
+                        this.draggable(elementState, element, () => {
+                            this.mode = Mode.DRAG;
+                            hideElementText();
+                        }, () => {
+                            skeletonSVGTemplate = skeletonSVGTemplate ?? makeSVGFromTemplate(state.label.structure.svg);
+                            setupSkeletonEdges(shape as SVG.G, skeletonSVGTemplate);
+                        }, () => {
+                            this.mode = Mode.IDLE;
+                            showElementText();
+                        });
+                    }
+                } else {
+                    this.draggable(null, element);
+                }
+            });
+        }
+
+        if (state) {
+            let resized = false;
+            let aborted = false;
+            let start = Date.now();
+            let draggedPointIndex: number | null = null; // Track which point is being dragged
+
+            (resizableInstance as any)
+                .resize({
+                    snapToGrid: 0.1,
+                    snapToAngle: this.snapToAngleResize,
+                })
+                .on('resizestart', (e: CustomEvent): void => {
+                    onResizeStart();
+                    resized = false;
+                    start = Date.now();
+                    this.resizableShape = shape;
+                    const detail = (e.detail.event.detail as any);
+                    draggedPointIndex = detail?.i ?? null;
+                })
+                .on('resizing', (e: CustomEvent): void => {
+                    resized = true;
+                    onResizing();
+
+                    if (this.configuration.snapToPoint &&
+                        !this.ctrlPressed &&
+                        ['polygon', 'polyline', 'points'].includes(state.shapeType) &&
+                        draggedPointIndex !== null &&
+                        draggedPointIndex >= 0) {
+                        const snapRadius = this.configuration.snapRadius / this.geometry.scale;
+
+                        applySnapToShapePoint(
+                            shape as SVG.Polygon | SVG.PolyLine,
+                            draggedPointIndex,
+                            this.drawnStates,
+                            this.geometry.offset,
+                            snapRadius,
+                            state.clientID,
+                        );
+                    }
+
+                    if (state.shapeType === 'skeleton' && e.target) {
+                        const { instance } = e.target as any;
+
+                        // rotate skeleton instead of wrapping bounding box
+                        const { rotation } = resizableInstance.transform();
+                        shape.rotate(rotation);
+
+                        const [x, y] = [instance.x(), instance.y()];
+                        const prevXtl = +resizableInstance.attr('data-xtl');
+                        const prevYtl = +resizableInstance.attr('data-ytl');
+                        const prevXbr = +resizableInstance.attr('data-xbr');
+                        const prevYbr = +resizableInstance.attr('data-ybr');
+
+                        if (prevXbr - prevXtl < 0.1) return;
+                        if (prevYbr - prevYtl < 0.1) return;
+
+                        for (const child of (shape as SVG.G).children()) {
+                            if (child.type === 'circle') {
+                                const childClientID = child.attr('data-client-id');
+                                if (state.elements.find((el: any) => el.clientID === childClientID).lock || false) {
+                                    continue;
+                                }
+                                const offsetX = (child.cx() - prevXtl) / (prevXbr - prevXtl);
+                                const offsetY = (child.cy() - prevYtl) / (prevYbr - prevYtl);
+                                child.center(offsetX * instance.width() + x, offsetY * instance.height() + y);
+                            }
+                        }
+
+                        resizableInstance.attr('data-xtl', x);
+                        resizableInstance.attr('data-ytl', y);
+                        resizableInstance.attr('data-xbr', x + instance.width());
+                        resizableInstance.attr('data-ybr', y + instance.height());
+
+                        resized = true;
+                        skeletonSVGTemplate = skeletonSVGTemplate ?? makeSVGFromTemplate(state.label.structure.svg);
+                        setupSkeletonEdges(shape as SVG.G, skeletonSVGTemplate);
+                        this.scheduleSkeletonResizerRefresh();
+                    }
+                })
+                .on('resizedone', (): void => {
+                    if (aborted) {
+                        this.resetViewPosition(state.clientID);
+                        return;
+                    }
+
+                    onResizeEnd();
+                    this.resizableShape = null;
+
+                    // be sure, that rotation in range [0; 360]
+                    let rotation = getRoundedRotation(shape);
+                    while (rotation < 0) rotation += 360;
+                    rotation %= 360;
+
+                    if (resized) {
+                        if (state.shapeType === 'skeleton') {
+                            if (rotation) {
+                                this.onEditDone(state, state.points, rotation);
+                            } else {
+                                const points: number[] = [];
+                                state.elements.forEach((element: any) => {
+                                    const elementShape = (shape as SVG.G).children()
+                                        .find((child: SVG.Shape) => (
+                                            child.id() === `cvat_canvas_shape_${element.clientID}`
+                                        ));
+
+                                    if (elementShape) {
+                                        points.push(...this.translateFromCanvas(
+                                            readPointsFromShape(elementShape),
+                                        ));
+                                    }
+                                });
+                                this.onEditDone(state, points, 0);
+                            }
+                        } else {
+                            // these points does not take into account possible transformations, applied on the element
+                            // so, if any (like rotation) we need to map them to canvas coordinate space
+                            let points = readPointsFromShape(shape);
+                            if (rotation) {
+                                points = this.translatePointsFromRotatedShape(shape, points);
+                            }
+                            this.onEditDone(state, this.translateFromCanvas(points), rotation);
+                        }
+
+                        this.canvas.dispatchEvent(
+                            new CustomEvent('canvas.resizeshape', {
+                                bubbles: false,
+                                cancelable: true,
+                                detail: {
+                                    state,
+                                    duration: Date.now() - start,
+                                },
+                            }),
+                        );
+                    }
+                }).on('resizeabort', () => {
+                    onResizeEnd();
+                    aborted = true;
+                    this.resizableShape = null;
+                    // disable internal resize events of SVG.js
+                    // call chain is (mouseup -> SVG.handler.end -> SVG.handler.resize-> resizeend)
+                    window.dispatchEvent(new MouseEvent('mouseup'));
+                });
+        } else {
+            if (this.resizableShape === shape) {
+                resizableInstance.fire('resizeabort');
+            }
+
+            (shape as any).off('resizestart');
+            (shape as any).off('resizing');
+            (shape as any).off('resizedone');
+            (shape as any).off('resizeabort');
+            (shape as any).resize('stop');
+        }
+    }
+
+    private isModifierPressed(event: MouseEvent | KeyboardEvent, modifier: MultiSelectModifier): boolean {
+        const modifiers = {
+            shift: event.shiftKey,
+            ctrl: event.ctrlKey,
+            alt: event.altKey,
+            meta: event.metaKey,
+        };
+
+        return modifiers[modifier] && Object.entries(modifiers)
+            .every(([key, pressed]) => key === modifier || !pressed);
+    }
+
+    // The selection-box modifier defaults to Shift.
+    private isMultiSelectModifierPressed(event: MouseEvent | KeyboardEvent): boolean {
+        return this.isModifierPressed(event, this.configuration.multiSelectModifier || 'shift');
+    }
+
+    // The modifier for adding or removing one clicked object defaults to Command/Meta.
+    private isMultiSelectObjectModifierPressed(event: MouseEvent | KeyboardEvent): boolean {
+        return this.isModifierPressed(event, this.configuration.multiSelectObjectModifier || 'meta');
+    }
+
+    private updateSelectedObjectsBoxCursor(event: MouseEvent | KeyboardEvent): void {
+        const modifierPressed = this.isMultiSelectModifierPressed(event) ||
+            this.isMultiSelectObjectModifierPressed(event);
+        this.selectedObjectsBox?.node.classList.toggle(
+            'cvat_canvas_selected_objects_box_modifier_pressed',
+            modifierPressed,
+        );
+        this.selectedObjectsLabel?.classList.toggle(
+            'cvat_canvas_selected_objects_label_modifier_pressed',
+            modifierPressed,
+        );
+    }
+
+    private onContentMouseDown = (event: MouseEvent): void => {
+        if (this.selectionPasteData && event.button === 0 && !event.altKey) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            this.placeSelectionPaste(event);
+            return;
+        }
+
+        const targetShape = (event.target as Element)?.closest?.('.cvat_canvas_shape');
+        const targetControl = !targetShape?.hasAttribute('data-polyline-id') &&
+            (event.target as Element)?.closest?.('.svg_select_points, .svg_select_points_rot');
+        if (event.button === 0 && this.isMultiSelectObjectModifierPressed(event) &&
+            [Mode.IDLE, Mode.SELECT].includes(this.mode) && !targetControl) {
+            const { offset } = this.controller.geometry;
+            const [x, y] = translateToSVG(this.content, [event.clientX, event.clientY]);
+            this.canvas.dispatchEvent(new CustomEvent('canvas.selectionrequested', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    x: x - offset,
+                    y: y - offset,
+                    states: this.controller.objects,
+                    mouseEvent: event,
+                },
+            }));
+            this.canvas.addEventListener('click', (clickEvent: MouseEvent) => {
+                const isSelectionClick = Math.hypot(
+                    clickEvent.clientX - event.clientX,
+                    clickEvent.clientY - event.clientY,
+                ) <= 2;
+                if (isSelectionClick) {
+                    clickEvent.preventDefault();
+                    clickEvent.stopPropagation();
+                }
+            }, { once: true, capture: true });
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
+
+        const onBackground = !targetShape;
+        if (event.button === 0 && this.isMultiSelectModifierPressed(event) &&
+            this.mode === Mode.IDLE && onBackground) {
+            this.pendingSelectionEvent = event;
+        }
+    };
+
+    private onContentMouseMove = (event: MouseEvent): void => {
+        this.updateSelectedObjectsBoxCursor(event);
+        if (this.selectionPasteData) {
+            this.moveSelectionPastePreview(event.clientX, event.clientY);
+            return;
+        }
+
+        if (this.pendingSelectionEvent && this.mode === Mode.IDLE) {
+            const distance = Math.hypot(
+                event.clientX - this.pendingSelectionEvent.clientX,
+                event.clientY - this.pendingSelectionEvent.clientY,
+            );
+            if (distance < 3) return;
+
+            this.selectionStartedWithModifier = true;
+            this.controller.selectObjects({ enabled: true });
+            this.selectHandler.move(event);
+            this.pendingSelectionEvent = null;
+        }
+    };
+
+    private onKeyDown = (e: KeyboardEvent): void => {
+        this.updateSelectedObjectsBoxCursor(e);
+
+        if (e.repeat) {
+            return;
+        }
+
+        const code = (e.code ?? '').toLowerCase();
+
+        if (code.includes('shift')) {
+            this.snapToAngleResize = consts.SNAP_TO_ANGLE_RESIZE_SHIFT;
+            if (this.activeElement) {
+                const shape = this.svgShapes[this.activeElement.clientID];
+                if (shape && shape?.remember('_selectHandler')?.options?.rotationPoint) {
+                    if (this.drawnStates[this.activeElement.clientID]?.shapeType === 'skeleton') {
+                        const wrappingRect = (shape as any).children().find((child: SVG.Element) => child.type === 'rect');
+                        if (wrappingRect) {
+                            (wrappingRect as any).resize({ snapToAngle: this.snapToAngleResize });
+                        }
+                    } else {
+                        (shape as any).resize({ snapToAngle: this.snapToAngleResize });
+                    }
+                }
+            }
+        }
+
+        if (code.includes('control')) {
+            this.ctrlPressed = true;
+        }
+    };
+
+    private onKeyUp = (e: KeyboardEvent): void => {
+        this.updateSelectedObjectsBoxCursor(e);
+
+        const code = (e.code ?? '').toLowerCase();
+
+        if (code.includes('shift') && this.activeElement) {
+            this.snapToAngleResize = consts.SNAP_TO_ANGLE_RESIZE_DEFAULT;
+            if (this.activeElement) {
+                const shape = this.svgShapes[this.activeElement.clientID];
+                if (shape && shape?.remember('_selectHandler')?.options?.rotationPoint) {
+                    if (this.drawnStates[this.activeElement.clientID]?.shapeType === 'skeleton') {
+                        const wrappingRect = (shape as any).children().find((child: SVG.Element) => child.type === 'rect');
+                        if (wrappingRect) {
+                            (wrappingRect as any).resize({ snapToAngle: this.snapToAngleResize });
+                        }
+                    } else {
+                        (shape as any).resize({ snapToAngle: this.snapToAngleResize });
+                    }
+                }
+            }
+        }
+
+        if (code.includes('control')) {
+            this.ctrlPressed = false;
+        }
+    };
+
+    private onMouseUp = (event: MouseEvent): void => {
+        this.pendingSelectionEvent = null;
+        if (event.button === 0 || event.button === 1) {
+            this.controller.disableDrag();
+        }
+    };
+
+    public constructor(model: CanvasModel & Master, controller: CanvasController) {
+        this.controller = controller;
+        this.geometry = controller.geometry;
+        this.svgShapes = {};
+        this.svgTexts = {};
+        this.drawnStates = {};
+        this.drawnIssueRegions = {};
+        this.activeElement = {
+            clientID: null,
+            attributeID: null,
+        };
+        this.highlightedElements = {
+            elementsIDs: [],
+            severity: null,
+        };
+        this.configuration = model.configuration;
+        this.mode = Mode.IDLE;
+        this.snapToAngleResize = consts.SNAP_TO_ANGLE_RESIZE_DEFAULT;
+        this.ctrlPressed = false;
+        this.pendingSelectionEvent = null;
+        this.selectionStartedWithModifier = false;
+        this.selectedObjects = [];
+        this.selectedObjectsSet = new Set();
+        this.selectedObjectsBox = null;
+        this.selectedObjectsBoxBitmap = null;
+        this.selectedObjectsLabel = null;
+        this.selectionPasteData = null;
+        this.selectionPasteStates = [];
+        this.selectionPasteOffset = { x: 0, y: 0 };
+        this.selectionPasteCenter = null;
+        this.selectionPasteStartedAt = 0;
+        this.selectionPasteShapes = [];
+        this.selectionPreviewFrame = null;
+        this.selectionPreviewUpdate = null;
+        this.cancelSelectionDrag = null;
+        this.innerObjectsFlags = {
+            drawHidden: {},
+            editHidden: {},
+            sliceHidden: {},
+        };
+
+        this.isImageLoading = true;
+        this.draggableShape = null;
+        this.resizableShape = null;
+
+        // Create HTML elements
+        this.text = window.document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        this.adoptedText = SVG.adopt((this.text as any) as HTMLElement) as SVG.Container;
+        this.background = window.document.createElement('canvas');
+        this.masksContent = window.document.createElement('canvas');
+        this.bitmapUpdateReqId = 0;
+        this.bitmap = window.document.createElement('canvas');
+        // window.document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+
+        this.grid = window.document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        this.gridPath = window.document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        this.gridPattern = window.document.createElementNS('http://www.w3.org/2000/svg', 'pattern');
+
+        this.content = window.document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        this.adoptedContent = SVG.adopt((this.content as any) as HTMLElement) as SVG.Container;
+
+        this.attachmentBoard = window.document.createElement('div');
+
+        this.canvas = window.document.createElement('div');
+
+        const gridDefs: SVGDefsElement = window.document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+        const gridRect: SVGRectElement = window.document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+
+        // Setup defs
+        const contentDefs = this.adoptedContent.defs();
+
+        this.issueRegionPattern_1 = contentDefs
+            .pattern(consts.BASE_PATTERN_SIZE, consts.BASE_PATTERN_SIZE, (add): void => {
+                add.line(0, 0, 0, 10).stroke('red');
+            })
+            .attr({
+                id: 'cvat_issue_region_pattern_1',
+                patternTransform: 'rotate(45)',
+                patternUnits: 'userSpaceOnUse',
+            });
+
+        this.issueRegionPattern_2 = contentDefs
+            .pattern(consts.BASE_PATTERN_SIZE, consts.BASE_PATTERN_SIZE, (add): void => {
+                add.line(0, 0, 0, 10).stroke('yellow');
+            })
+            .attr({
+                id: 'cvat_issue_region_pattern_2',
+                patternTransform: 'rotate(45)',
+                patternUnits: 'userSpaceOnUse',
+            });
+
+        // Setup grid
+        this.grid.setAttribute('id', 'cvat_canvas_grid');
+        this.grid.setAttribute('version', '2');
+        this.gridPath.setAttribute('d', 'M 1000 0 L 0 0 0 1000');
+        this.gridPath.setAttribute('fill', 'none');
+        this.gridPath.setAttribute('stroke-width', `${consts.BASE_GRID_WIDTH}`);
+        this.gridPath.setAttribute('opacity', 'inherit');
+        this.gridPattern.setAttribute('id', 'cvat_canvas_grid_pattern');
+        this.gridPattern.setAttribute('width', '100');
+        this.gridPattern.setAttribute('height', '100');
+        this.gridPattern.setAttribute('patternUnits', 'userSpaceOnUse');
+        gridRect.setAttribute('width', '100%');
+        gridRect.setAttribute('height', '100%');
+        gridRect.setAttribute('fill', 'url(#cvat_canvas_grid_pattern)');
+
+        // setup skeletons supplementary state
+        this.skeletonResizerRefreshRequest = null;
+
+        // Setup content
+        this.text.setAttribute('id', 'cvat_canvas_text_content');
+        this.background.setAttribute('id', 'cvat_canvas_background');
+        this.masksContent.setAttribute('id', 'cvat_canvas_masks_content');
+        this.content.setAttribute('id', 'cvat_canvas_content');
+        this.bitmap.setAttribute('id', 'cvat_canvas_bitmap');
+        this.bitmap.style.display = 'none';
+
+        // Setup sticked div
+        this.attachmentBoard.setAttribute('id', 'cvat_canvas_attachment_board');
+
+        // Setup wrappers
+        this.canvas.setAttribute('id', 'cvat_canvas_wrapper');
+
+        // Unite created HTML elements together
+        this.grid.appendChild(gridDefs);
+        this.grid.appendChild(gridRect);
+
+        gridDefs.appendChild(this.gridPattern);
+        this.gridPattern.appendChild(this.gridPath);
+
+        this.canvas.appendChild(this.text);
+        this.canvas.appendChild(this.background);
+        this.canvas.appendChild(this.masksContent);
+        this.canvas.appendChild(this.bitmap);
+        this.canvas.appendChild(this.grid);
+        this.canvas.appendChild(this.content);
+        this.canvas.appendChild(this.attachmentBoard);
+
+        // Setup API handlers
+        this.autoborderHandler = new AutoborderHandlerImpl(this.content, () => this.ctrlPressed);
+        this.drawHandler = new DrawHandlerImpl(
+            this.onDrawDone,
+            this.adoptedContent,
+            this.adoptedText,
+            this.autoborderHandler,
+            this.geometry,
+            this.configuration,
+            () => this.drawnStates,
+            () => this.ctrlPressed,
+        );
+        this.masksHandler = new MasksHandlerImpl(
+            this.onDrawDone,
+            this.controller.draw.bind(this.controller),
+            this.onEditStart,
+            this.onEditDone,
+            this.drawHandler,
+            this.masksContent,
+            (undoAction?: string, redoAction?: string): void => {
+                this.canvas.dispatchEvent(new CustomEvent('canvas.historychanged', {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: { source: CanvasHistorySource.MASK, undoAction, redoAction },
+                }));
+            },
+        );
+        this.editHandler = new EditHandlerImpl(this.onEditDone, this.adoptedContent, this.autoborderHandler);
+        this.mergeHandler = new MergeHandlerImpl(
+            this.onMergeDone,
+            this.onFindObject,
+            this.adoptedContent,
+        );
+        this.splitHandler = new SplitHandlerImpl(
+            this.onSplitDone,
+            this.onFindObject,
+            this.adoptedContent,
+        );
+        this.objectSelector = new ObjectSelectorImpl(
+            this.onFindObject,
+            () => this.controller.objects,
+            this.geometry,
+            this.adoptedContent,
+        );
+        this.groupHandler = new GroupHandlerImpl(this.onSelectDone, this.objectSelector);
+        this.selectHandler = new SelectHandlerImpl(this.onSelectObjectsDone, this.objectSelector);
+        this.sliceHandler = new SliceHandlerImpl(
+            (clientID) => this.setupInnerFlags(clientID, 'sliceHidden', true),
+            (clientID) => this.setupInnerFlags(clientID, 'sliceHidden', false),
+            this.onSliceDone,
+            this.onMessage,
+            this.onError,
+            () => this.controller.objects,
+            this.geometry,
+            this.adoptedContent,
+            this.objectSelector,
+        );
+        this.regionSelector = new RegionSelectorImpl(
+            this.onRegionSelected,
+            this.adoptedContent,
+            this.geometry,
+        );
+        this.zoomHandler = new ZoomHandlerImpl(this.onFocusRegion, this.adoptedContent, this.geometry);
+        this.interactionHandler = new InteractionHandlerImpl(
+            this.onInteraction,
+            this.onMessage,
+            this.adoptedContent,
+            this.geometry,
+            this.configuration,
+        );
+
+        // Setup event handlers
+        this.canvas.addEventListener('dblclick', (e: MouseEvent): void => {
+            if (this.activeElement.clientID !== null) {
+                // -1 means auto padding based on the shape size
+                this.controller.focus(this.activeElement.clientID, -1);
+            } else {
+                this.controller.fit();
+            }
+            e.preventDefault();
+        });
+
+        this.canvas.addEventListener('mousedown', (event): void => {
+            if ([0, 1].includes(event.button)) {
+                // the multi-selection modifier + left button is reserved for the rubber-band
+                // selection, so it must not start panning the image
+                const reservedForSelection = event.button === 0 && this.isMultiSelectModifierPressed(event);
+                if (
+                    ([Mode.IDLE, Mode.DRAG_CANVAS, Mode.MERGE, Mode.SPLIT].includes(this.mode) &&
+                        !reservedForSelection) ||
+                    event.button === 1 || (event.altKey && !reservedForSelection)
+                ) {
+                    this.controller.enableDrag(event.clientX, event.clientY);
+                }
+            }
+        });
+        this.canvas.addEventListener('mousedown', this.onContentMouseDown, true);
+        this.canvas.addEventListener('mousemove', this.onContentMouseMove, true);
+        this.canvas.addEventListener('contextmenu', (event: MouseEvent): void => {
+            if (this.mode !== Mode.SELECT || !this.selectedObjectsBox) return;
+
+            // The selection outline is click-through in Select mode, but keeps its context menu.
+            const [x, y] = translateToSVG(this.content, [event.clientX, event.clientY]);
+            const box = this.selectedObjectsBox.bbox();
+            if (x >= box.x && x <= box.x2 && y >= box.y && y <= box.y2) {
+                event.preventDefault();
+                event.stopPropagation();
+                this.openSelectedObjectsMenu(event.clientX, event.clientY);
+            }
+        }, true);
+
+        window.document.addEventListener('mouseup', this.onMouseUp);
+        window.document.addEventListener('keydown', this.onKeyDown);
+        window.document.addEventListener('keyup', this.onKeyUp);
+
+        for (const eventName of ['wheel', 'mousedown', 'dblclick', 'contextmenu']) {
+            this.attachmentBoard.addEventListener(eventName, (event) => {
+                event.stopPropagation();
+            });
+        }
+
+        this.canvas.addEventListener('wheel', (event): void => {
+            if (this.ctrlPressed) {
+                // we do not use event.ctrlKey to handle pinch zoom using touchpad correctly
+                // peach zoom automatically generates 'wheel' event with event.ctrlKey equals to true
+                // even when the ctrl key is not pressed actually
+                return;
+            }
+
+            let { deltaY } = event;
+            // clamp too high values to avoid strong zooming
+            // high values are usually applicable to mice
+            // 8 is a good experimental value to avoid strong zooming
+            const LIMIT_DELTA_Y = 8;
+            deltaY = clamp(deltaY, -LIMIT_DELTA_Y, LIMIT_DELTA_Y);
+
+            const { offset } = this.controller.geometry;
+            const point = translateToSVG(this.content, [event.clientX, event.clientY]);
+            this.controller.zoom(point[0] - offset, point[1] - offset, deltaY);
+            this.canvas.dispatchEvent(
+                new CustomEvent('canvas.zoom', {
+                    bubbles: false,
+                    cancelable: true,
+                }),
+            );
+            event.preventDefault();
+        });
+
+        this.canvas.addEventListener('mousemove', (e): void => {
+            this.controller.drag(e.clientX, e.clientY);
+
+            if (this.mode !== Mode.IDLE) return;
+            if (e.ctrlKey || e.altKey) return;
+
+            if (!this.isImageLoading) {
+                const { offset } = this.controller.geometry;
+                const [x, y] = translateToSVG(this.content, [e.clientX, e.clientY]);
+                const event: CustomEvent = new CustomEvent('canvas.moved', {
+                    bubbles: false,
+                    cancelable: true,
+                    detail: {
+                        x: x - offset,
+                        y: y - offset,
+                        states: this.controller.objects,
+                    },
+                });
+
+                this.canvas.dispatchEvent(event);
+            }
+        });
+
+        this.content.oncontextmenu = (): boolean => false;
+        model.subscribe(this);
+    }
+
+    public notify(model: CanvasModel & Master, reason: UpdateReasons): void {
+        if ([UpdateReasons.CANCEL, UpdateReasons.DESTROY, UpdateReasons.OBJECTS_UPDATED,
+            UpdateReasons.SELECTED_OBJECTS_UPDATED,
+            UpdateReasons.FITTED_CANVAS, UpdateReasons.IMAGE_ZOOMED, UpdateReasons.IMAGE_FITTED,
+            UpdateReasons.IMAGE_ROTATED, UpdateReasons.IMAGE_MOVED].includes(reason)) {
+            // A canvas transform invalidates the pointer coordinates cached at drag start.
+            this.cancelSelectionDrag?.();
+        }
+        this.geometry = this.controller.geometry;
+        if (reason === UpdateReasons.CONFIG_UPDATED) {
+            const { activeElement } = this;
+            this.deactivate();
+            const { configuration } = model;
+
+            const updateShapeViews = (states: DrawnState[], parentState?: DrawnState): void => {
+                for (const drawnState of states) {
+                    const {
+                        fill, stroke, 'fill-opacity': fillOpacity,
+                    } = this.getShapeColorization(drawnState, { parentState });
+                    const shapeView = window.document.getElementById(`cvat_canvas_shape_${drawnState.clientID}`);
+                    const [objectState] = this.controller.objects
+                        .filter((_state: any) => _state.clientID === drawnState.clientID);
+                    if (shapeView) {
+                        const handler = (shapeView as any).instance.remember('_selectHandler');
+                        if (handler && handler.nested) {
+                            handler.nested.fill({ color: fill });
+                        }
+
+                        if (drawnState.shapeType === 'mask') {
+                            // if there are masks, we need to redraw them
+                            this.deleteObjects([drawnState]);
+                            this.addObjects([objectState]);
+                            continue;
+                        }
+
+                        (shapeView as any).instance
+                            .fill({ color: fill, opacity: fillOpacity })
+                            .stroke({ color: stroke });
+                    }
+
+                    if (drawnState.elements) {
+                        updateShapeViews(drawnState.elements, drawnState);
+                    }
+                }
+            };
+
+            const withUpdatingShapeViews = configuration.shapeOpacity !== this.configuration.shapeOpacity ||
+                configuration.selectedShapeOpacity !== this.configuration.selectedShapeOpacity ||
+                configuration.outlinedBorders !== this.configuration.outlinedBorders ||
+                configuration.colorBy !== this.configuration.colorBy ||
+                configuration.showConflicts !== this.configuration.showConflicts;
+
+            if (configuration.displayAllText && !this.configuration.displayAllText) {
+                for (const i in this.drawnStates) {
+                    if (!(i in this.svgTexts)) {
+                        this.svgTexts[i] = this.addText(this.drawnStates[i]);
+                    }
+                }
+            } else if (configuration.displayAllText === false && this.configuration.displayAllText) {
+                for (const clientID in this.drawnStates) {
+                    if (+clientID !== activeElement.clientID) {
+                        this.deleteText(+clientID);
+                    }
+                }
+            }
+
+            const recreateText = configuration.textContent !== this.configuration.textContent;
+            const updateTextPosition = configuration.displayAllText !== this.configuration.displayAllText ||
+                configuration.textFontSize !== this.configuration.textFontSize ||
+                configuration.textPosition !== this.configuration.textPosition ||
+                recreateText;
+
+            if (configuration.smoothImage === true) {
+                this.background.classList.remove('cvat_canvas_pixelized');
+            } else if (configuration.smoothImage === false) {
+                this.background.classList.add('cvat_canvas_pixelized');
+            }
+
+            this.configuration = configuration;
+            if (withUpdatingShapeViews) {
+                updateShapeViews(Object.values(this.drawnStates));
+                if (this.selectedObjects.length) {
+                    this.setupSelectedObjects();
+                }
+            }
+
+            if (recreateText) {
+                const states = this.controller.objects;
+                for (const key of Object.keys(this.drawnStates)) {
+                    const clientID = +key;
+                    const [state] = states.filter((_state: any) => _state.clientID === clientID);
+                    if (clientID in this.svgTexts) {
+                        this.deleteText(+clientID);
+                        if (state) {
+                            this.addText(state);
+                        }
+                    }
+                }
+            }
+
+            if (updateTextPosition) {
+                for (const i in this.drawnStates) {
+                    if (i in this.svgTexts) {
+                        this.updateTextPosition(this.svgTexts[i]);
+                    }
+                }
+            }
+
+            if (typeof configuration.CSSImageFilter === 'string') {
+                this.background.style.filter = configuration.CSSImageFilter;
+            }
+            this.activate(activeElement);
+            this.editHandler.configure(this.configuration);
+            this.drawHandler.configure(this.configuration);
+            this.masksHandler.configure(this.configuration);
+            this.autoborderHandler.configure(this.configuration);
+            this.interactionHandler.configure(this.configuration);
+            this.sliceHandler.configure(this.configuration);
+            this.transformCanvas();
+
+            // remove if exist and not enabled
+            // this.setupObjects([]);
+            // this.setupObjects(model.objects);
+        } else if (reason === UpdateReasons.BITMAP) {
+            const { imageBitmap } = model;
+            this.canvas.classList.toggle('cvat_canvas_bitmap_enabled', imageBitmap);
+            if (imageBitmap) {
+                this.bitmap.style.display = '';
+                this.redrawBitmap();
+            } else {
+                this.bitmap.style.display = 'none';
+            }
+        } else if (reason === UpdateReasons.IMAGE_CHANGED) {
+            this.canvas.removeAttribute('data-frame-number');
+            const { image } = model;
+            if (image) {
+                this.isImageLoading = false;
+                const ctx = this.background.getContext('2d');
+                this.background.setAttribute('width', `${image.renderWidth}px`);
+                this.background.setAttribute('height', `${image.renderHeight}px`);
+
+                if (ctx) {
+                    ctx.drawImage(image.imageData, 0, 0, image.renderWidth, image.renderHeight);
+                }
+
+                if (model.imageIsDeleted) {
+                    let { width, height } = this.background;
+                    if (image.imageData instanceof ImageData) {
+                        width = image.imageData.width;
+                        height = image.imageData.height;
+                    }
+
+                    this.background.classList.add('cvat_canvas_removed_image');
+                    const canvasContext = this.background.getContext('2d');
+                    const fontSize = width / 10;
+                    canvasContext.font = `bold ${fontSize}px serif`;
+                    canvasContext.textAlign = 'center';
+                    canvasContext.lineWidth = fontSize / 20;
+                    canvasContext.strokeStyle = 'white';
+                    canvasContext.strokeText('IMAGE REMOVED', width / 2, height / 2);
+                    canvasContext.fillStyle = 'black';
+                    canvasContext.fillText('IMAGE REMOVED', width / 2, height / 2);
+                } else if (this.background.classList.contains('cvat_canvas_removed_image')) {
+                    this.background.classList.remove('cvat_canvas_removed_image');
+                }
+
+                this.moveCanvas();
+                this.resizeCanvas();
+                this.transformCanvas();
+            } else {
+                this.isImageLoading = true;
+            }
+        } else if (reason === UpdateReasons.FITTED_CANVAS) {
+            // Canvas geometry is going to be changed. Old object positions aren't valid any more
+            this.setupObjects([]);
+            this.setupIssueRegions({});
+            this.moveCanvas();
+            this.resizeCanvas();
+            this.canvas.dispatchEvent(
+                new CustomEvent('canvas.reshape', {
+                    bubbles: false,
+                    cancelable: true,
+                }),
+            );
+        } else if ([UpdateReasons.IMAGE_ZOOMED, UpdateReasons.IMAGE_FITTED].includes(reason)) {
+            if (reason === UpdateReasons.IMAGE_FITTED) {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.fit', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+            }
+
+            this.moveCanvas();
+            this.transformCanvas();
+        } else if (reason === UpdateReasons.IMAGE_ROTATED) {
+            this.transformCanvas();
+        } else if (reason === UpdateReasons.IMAGE_MOVED) {
+            this.moveCanvas();
+        } else if (reason === UpdateReasons.OBJECTS_UPDATED) {
+            if (this.mode !== Mode.SELECT) this.objectSelector.resetSelected();
+            this.setupObjects(this.controller.objects);
+            if (this.mode === Mode.SELECT) {
+                const states = this.controller.objects.filter((state: any): boolean => (
+                    this.selectedObjectsSet.has(state.clientID)
+                ));
+                this.selectHandler.setSelected(states, false);
+            }
+            // re-apply the multi-selection visual, lost when shapes are redrawn
+            this.setupSelectedObjects();
+            if (this.mode === Mode.DRAW && this.selectionPasteData) {
+                this.renderSelectionPastePreview();
+            }
+            if (this.mode === Mode.MERGE) {
+                this.mergeHandler.repeatSelection();
+            }
+            if (model.imageID !== null) {
+                this.canvas.setAttribute('data-frame-number', String(model.imageID));
+            }
+            const event: CustomEvent = new CustomEvent('canvas.setup');
+            this.canvas.dispatchEvent(event);
+        } else if (reason === UpdateReasons.ISSUE_REGIONS_UPDATED) {
+            this.setupIssueRegions(this.controller.issueRegions);
+        } else if (reason === UpdateReasons.GRID_UPDATED) {
+            const size: Size = this.geometry.grid;
+            this.gridPattern.setAttribute('width', `${size.width}`);
+            this.gridPattern.setAttribute('height', `${size.height}`);
+        } else if (reason === UpdateReasons.SHAPE_FOCUSED) {
+            const padding = this.configuration.focusedObjectPadding ?? 0;
+            const { clientID } = this.controller.focusData;
+            const drawnState = this.drawnStates[clientID];
+            const object = this.svgShapes[clientID];
+            if (drawnState && object) {
+                const { offset } = this.geometry;
+                let [x, y, width, height] = [0, 0, 0, 0];
+
+                if (drawnState.shapeType === 'mask') {
+                    const [xtl, ytl, xbr, ybr] = drawnState.points.slice(-4);
+                    x = xtl + offset;
+                    y = ytl + offset;
+                    width = xbr - xtl + 1;
+                    height = ybr - ytl + 1;
+                } else {
+                    const bbox: SVG.BBox = object.bbox();
+                    ({
+                        x, y, width, height,
+                    } = bbox);
+                }
+
+                this.onFocusRegion(x - padding, y - padding, width + padding * 2, height + padding * 2);
+            }
+        } else if (reason === UpdateReasons.SHAPE_ACTIVATED) {
+            this.activate(this.controller.activeElement);
+        } else if (reason === UpdateReasons.SHAPE_HIGHLIGHTED) {
+            this.highlight(this.controller.highlightedElements);
+        } else if (reason === UpdateReasons.SELECT_REGION) {
+            if (this.mode === Mode.SELECT_REGION) {
+                this.regionSelector.select(true);
+                this.canvas.style.cursor = 'pointer';
+            } else {
+                this.regionSelector.select(false);
+                this.canvas.style.cursor = '';
+            }
+        } else if (reason === UpdateReasons.DRAG_CANVAS) {
+            if (this.mode === Mode.DRAG_CANVAS) {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.dragstart', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+                this.canvas.style.cursor = 'move';
+            } else {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.dragstop', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+                this.canvas.style.cursor = '';
+            }
+        } else if (reason === UpdateReasons.ZOOM_CANVAS) {
+            if (this.mode === Mode.ZOOM_CANVAS) {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.zoomstart', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+                this.canvas.style.cursor = 'zoom-in';
+                this.zoomHandler.zoom();
+            } else {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.zoomstop', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+                this.canvas.style.cursor = '';
+                this.zoomHandler.cancel();
+            }
+        } else if (reason === UpdateReasons.DRAW) {
+            const data: DrawData = this.controller.drawData;
+            if (data.enabled && [Mode.IDLE, Mode.DRAW].includes(this.mode)) {
+                if (data.initialStates?.length) {
+                    this.startSelectionPaste(data);
+                } else if (data.shapeType !== 'mask') {
+                    this.drawHandler.draw(data, this.geometry);
+                } else {
+                    this.masksHandler.draw(data);
+                }
+
+                if (this.mode === Mode.IDLE) {
+                    this.canvas.style.cursor = 'crosshair';
+                    this.mode = Mode.DRAW;
+                    this.canvas.dispatchEvent(
+                        new CustomEvent('canvas.drawstart', {
+                            bubbles: false,
+                            cancelable: true,
+                            detail: {
+                                drawData: data,
+                            },
+                        }),
+                    );
+
+                    if (typeof data.redraw === 'number') {
+                        this.setupInnerFlags(data.redraw, 'drawHidden', true);
+                    }
+                }
+            } else if (this.mode !== Mode.IDLE) {
+                this.canvas.style.cursor = '';
+                this.mode = Mode.IDLE;
+                if (this.selectionPasteData) {
+                    this.clearSelectionPastePreview();
+                } else if (this.masksHandler.enabled) {
+                    this.masksHandler.draw(data);
+                } else {
+                    this.drawHandler.draw(data, this.geometry);
+                }
+            }
+        } else if (reason === UpdateReasons.EDIT) {
+            const data = this.controller.editData;
+            if (data.enabled && data.state.shapeType === 'mask') {
+                this.masksHandler.edit(data);
+            } else if (this.masksHandler.enabled) {
+                this.masksHandler.edit(data);
+            } else if (this.editHandler.enabled && this.editHandler.shapeType === 'polyline') {
+                this.editHandler.edit(data);
+            }
+        } else if (reason === UpdateReasons.INTERACT) {
+            const data: InteractionData = this.controller.interactionData;
+            if (data.enabled && this.mode === Mode.IDLE) {
+                this.canvas.style.cursor = '';
+                this.mode = Mode.INTERACT;
+            }
+
+            if (data.enabled && ['draw_box', 'draw_points'].includes(data.command)) {
+                this.canvas.style.cursor = 'crosshair';
+            }
+
+            if (!data.enabled && this.mode === Mode.INTERACT) {
+                this.canvas.style.cursor = '';
+                this.mode = Mode.IDLE;
+            }
+            this.interactionHandler.interact(data);
+        } else if (reason === UpdateReasons.MERGE) {
+            const data: MergeData = this.controller.mergeData;
+            if (data.enabled) {
+                this.canvas.style.cursor = 'copy';
+                this.mode = Mode.MERGE;
+            }
+            this.mergeHandler.merge(data);
+        } else if (reason === UpdateReasons.SPLIT) {
+            const data: SplitData = this.controller.splitData;
+            if (data.enabled) {
+                this.canvas.style.cursor = 'copy';
+                this.mode = Mode.SPLIT;
+                this.splitHandler.split(data);
+            }
+        } else if ([UpdateReasons.JOIN, UpdateReasons.GROUP].includes(reason)) {
+            let data: GroupData | JoinData = null;
+            if (reason === UpdateReasons.GROUP) {
+                data = this.controller.groupData;
+                this.mode = Mode.GROUP;
+                this.groupHandler.group(data, {});
+            } else {
+                data = this.controller.joinData;
+                this.mode = Mode.JOIN;
+
+                this.onMessage([
+                    '### Join shapes',
+                    '',
+                    'Select masks or polygons of the same label to join them.',
+                    '',
+                    '**Actions**',
+                    '- Click a shape to select it.',
+                    '- Click a selected shape again to remove it from the selection.',
+                ].join('\n'), 'join');
+
+                this.groupHandler.group(data, {
+                    shapeType: ['mask', 'polygon'],
+                    objectType: ['shape'],
+                    restrictToFirstSelectedType: true,
+                });
+            }
+        } else if (reason === UpdateReasons.SLICE) {
+            const data = this.controller.sliceData;
+            if (data.enabled && this.mode === Mode.IDLE) {
+                this.mode = Mode.SLICE;
+                this.sliceHandler.slice(data);
+            }
+        } else if (reason === UpdateReasons.SELECT_OBJECTS) {
+            const data: SelectData = this.controller.selectData;
+            if (data.enabled) {
+                this.mode = Mode.SELECT;
+                this.selectHandler.select(
+                    data, {
+                        objectType: ['shape', 'track'], preserveAppearance: true, replaceOnSelection: true,
+                    }, this.pendingSelectionEvent,
+                );
+            } else {
+                this.selectHandler.select(data, {});
+            }
+        } else if (reason === UpdateReasons.SELECTED_OBJECTS_UPDATED) {
+            this.selectedObjects = this.controller.selectedObjects;
+            this.selectedObjectsSet = new Set(this.selectedObjects);
+            if (this.mode === Mode.SELECT) {
+                const states = this.controller.objects.filter((state: any): boolean => (
+                    this.selectedObjectsSet.has(state.clientID)
+                ));
+                this.selectHandler.setSelected(states, false);
+            }
+            this.setupSelectedObjects();
+            if (this.mode === Mode.DRAW && this.selectionPasteData) {
+                this.renderSelectionPastePreview();
+            }
+        } else if (reason === UpdateReasons.SELECT) {
+            this.objectSelector.push(this.controller.selected);
+            if (this.mode === Mode.MERGE) {
+                this.mergeHandler.select(this.controller.selected);
+            } else if (this.mode === Mode.SPLIT) {
+                this.splitHandler.select(this.controller.selected);
+            } else if (this.mode === Mode.SELECT) {
+                this.selectHandler.push(this.controller.selected);
+            }
+        } else if (reason === UpdateReasons.CANCEL) {
+            if (this.mode === Mode.DRAW) {
+                if (this.selectionPasteData) {
+                    this.clearSelectionPastePreview();
+                } else if (this.masksHandler.enabled) {
+                    this.masksHandler.cancel();
+                } else {
+                    this.drawHandler.cancel();
+                }
+                this.restoreDrawHiddenObjects();
+            } else if (this.mode === Mode.INTERACT) {
+                this.interactionHandler.cancel();
+            } else if (this.mode === Mode.MERGE) {
+                this.mergeHandler.cancel();
+            } else if (this.mode === Mode.SPLIT) {
+                this.splitHandler.cancel();
+            } else if (this.mode === Mode.GROUP || this.mode === Mode.JOIN) {
+                this.groupHandler.cancel();
+            } else if (this.mode === Mode.SELECT) {
+                this.selectHandler.cancel();
+            } else if (this.mode === Mode.SLICE) {
+                this.sliceHandler.cancel();
+            } else if (this.mode === Mode.SELECT_REGION) {
+                this.regionSelector.cancel();
+            } else if (this.mode === Mode.EDIT) {
+                if (this.masksHandler.enabled) {
+                    this.masksHandler.cancel();
+                } else {
+                    this.editHandler.cancel();
+                }
+            } else if (this.mode === Mode.DRAG_CANVAS) {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.dragstop', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+            } else if (this.mode === Mode.ZOOM_CANVAS) {
+                this.zoomHandler.cancel();
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.zoomstop', {
+                        bubbles: false,
+                        cancelable: true,
+                    }),
+                );
+            }
+            this.canvas.style.cursor = '';
+            this.dispatchCanceledEvent();
+        } else if (reason === UpdateReasons.DATA_FAILED) {
+            this.onError(model.exception, 'data fetching');
+        } else if (reason === UpdateReasons.DESTROY) {
+            this.cancelSelectionPreview();
+            this.canvas.dispatchEvent(
+                new CustomEvent('canvas.destroy', {
+                    bubbles: false,
+                    cancelable: true,
+                }),
+            );
+
+            window.document.removeEventListener('keydown', this.onKeyDown);
+            window.document.removeEventListener('keyup', this.onKeyUp);
+            window.document.removeEventListener('mouseup', this.onMouseUp);
+            this.canvas.removeEventListener('mousedown', this.onContentMouseDown, true);
+            this.canvas.removeEventListener('mousemove', this.onContentMouseMove, true);
+            this.interactionHandler.destroy();
+        }
+
+        if (model.imageBitmap && [UpdateReasons.OBJECTS_UPDATED].includes(reason)) {
+            this.redrawBitmap();
+        }
+    }
+
+    public html(): HTMLDivElement {
+        return this.canvas;
+    }
+
+    public undo(): boolean {
+        return this.masksHandler.undo();
+    }
+
+    public redo(): boolean {
+        return this.masksHandler.redo();
+    }
+
+    public setupConflictRegions(state: any): number[] {
+        let cx = 0;
+        let cy = 0;
+        const shape = this.svgShapes[state.clientID];
+        if (!shape) return [];
+        const box = (shape.node as any).getBBox();
+        cx = box.x + (box.width) / 2;
+        cy = box.y;
+        return [cx, cy];
+    }
+
+    public translateFromSVG(point: number[]): number[] {
+        return translateFromSVG(this.content, point);
+    }
+
+    private redrawBitmap(): void {
+        this.bitmapUpdateReqId++;
+        const { bitmapUpdateReqId } = this;
+        const width = +this.background.style.width.slice(0, -2);
+        const height = +this.background.style.height.slice(0, -2);
+        this.bitmap.setAttribute('width', `${width}px`);
+        this.bitmap.setAttribute('height', `${height}px`);
+        const states = this.controller.objects;
+
+        const ctx = this.bitmap.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        if (ctx) {
+            ctx.clearRect(0, 0, width, height);
+            for (const state of states) {
+                if (state.hidden || state.outside) continue;
+                ctx.fillStyle = 'white';
+                if (['rectangle', 'polygon', 'cuboid'].includes(state.shapeType)) {
+                    let points = [...state.points];
+                    if (state.shapeType === 'rectangle') {
+                        points = rotate2DPoints(
+                            points[0] + (points[2] - points[0]) / 2,
+                            points[1] + (points[3] - points[1]) / 2,
+                            state.rotation,
+                            [
+                                points[0], // xtl
+                                points[1], // ytl
+                                points[2], // xbr
+                                points[1], // ytl
+                                points[2], // xbr
+                                points[3], // ybr
+                                points[0], // xtl
+                                points[3], // ybr
+                            ],
+                        );
+                    } else if (state.shapeType === 'cuboid') {
+                        points = [
+                            points[0],
+                            points[1],
+                            points[4],
+                            points[5],
+                            points[8],
+                            points[9],
+                            points[12],
+                            points[13],
+                        ];
+                    }
+                    ctx.beginPath();
+                    ctx.moveTo(points[0], points[1]);
+                    for (let i = 0; i < points.length; i += 2) {
+                        ctx.lineTo(points[i], points[i + 1]);
+                    }
+                    ctx.closePath();
+                    ctx.fill();
+                }
+
+                if (state.shapeType === 'ellipse') {
+                    const [cx, cy, rightX, topY] = state.points;
+                    ctx.beginPath();
+                    ctx.ellipse(cx, cy, rightX - cx, cy - topY, (state.rotation * Math.PI) / 180.0, 0, 2 * Math.PI);
+                    ctx.closePath();
+                    ctx.fill();
+                }
+
+                if (state.shapeType === 'mask') {
+                    const { points } = state;
+                    const [left, top, right, bottom] = points.slice(-4);
+                    const imageBitmap = RLEToImageData(255, 255, 255, points);
+                    imageDataToDataURL(
+                        imageBitmap,
+                        right - left + 1,
+                        bottom - top + 1,
+                        (dataURL: string) => {
+                            if (bitmapUpdateReqId === this.bitmapUpdateReqId) {
+                                const img = document.createElement('img');
+                                img.addEventListener('load', () => {
+                                    ctx.drawImage(img, left, top);
+                                    URL.revokeObjectURL(dataURL);
+                                }, { once: true });
+                                img.addEventListener('error', () => {
+                                    URL.revokeObjectURL(dataURL);
+                                }, { once: true });
+                                img.src = dataURL;
+                            } else {
+                                URL.revokeObjectURL(dataURL);
+                            }
+                        },
+                    );
+                }
+
+                if (state.shapeType === 'cuboid') {
+                    for (let i = 0; i < 5; i++) {
+                        const points = [
+                            state.points[(0 + i * 4) % 16],
+                            state.points[(1 + i * 4) % 16],
+                            state.points[(2 + i * 4) % 16],
+                            state.points[(3 + i * 4) % 16],
+                            state.points[(6 + i * 4) % 16],
+                            state.points[(7 + i * 4) % 16],
+                            state.points[(4 + i * 4) % 16],
+                            state.points[(5 + i * 4) % 16],
+                        ];
+                        ctx.beginPath();
+                        ctx.moveTo(points[0], points[1]);
+                        for (let j = 0; j < points.length; j += 2) {
+                            ctx.lineTo(points[j], points[j + 1]);
+                        }
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+    }
+
+    private saveState(state: any): DrawnState {
+        const result = {
+            clientID: state.clientID,
+            outside: state.outside,
+            occluded: state.occluded,
+            source: state.source,
+            hidden: state.hidden,
+            lock: state.lock,
+            shapeType: state.shapeType,
+            points: [...state.points],
+            rotation: state.rotation,
+            attributes: { ...state.attributes },
+            descriptions: [...state.descriptions],
+            zOrder: state.zOrder,
+            pinned: state.pinned,
+            updated: state.updated,
+            frame: state.frame,
+            label: state.label,
+            group: { id: state.group.id, color: state.group.color },
+            color: state.color,
+            elements: state.shapeType === 'skeleton' ?
+                state.elements.map((element: any) => this.saveState(element)) : null,
+            visibleSkeletonElements: state.shapeType === 'skeleton' ?
+                this.getVisibleSkeletonElements(state.clientID) : null,
+        };
+
+        return result;
+    }
+
+    private getShapeColorization(state: any, opts: {
+        parentState?: any,
+    } = {}): { fill: string; stroke: string, 'fill-opacity': number } {
+        const { shapeType } = state;
+        const parentShapeType = opts.parentState?.shapeType;
+        const { configuration } = this;
+        const { colorBy, shapeOpacity, outlinedBorders } = configuration;
+        let shapeColor = '';
+
+        if (colorBy === ColorBy.INSTANCE) {
+            shapeColor = state.color;
+        } else if (colorBy === ColorBy.GROUP) {
+            shapeColor = state.group.color;
+        } else if (colorBy === ColorBy.LABEL) {
+            shapeColor = state.label.color;
+        }
+        if (this.highlightedElements.elementsIDs.length) {
+            if (this.highlightedElements.elementsIDs.includes(state.clientID)) {
+                if (this.highlightedElements.severity === HighlightSeverity.ERROR) {
+                    shapeColor = consts.CONFLICT_COLOR;
+                } else if (this.highlightedElements.severity === HighlightSeverity.WARNING) {
+                    shapeColor = consts.WARNING_COLOR;
+                }
+            } else {
+                shapeColor = consts.SHADED_COLOR;
+            }
+        }
+        const outlinedColor = parentShapeType === 'skeleton' ? 'black' : outlinedBorders || shapeColor;
+
+        return {
+            fill: shapeColor,
+            stroke: outlinedColor,
+            'fill-opacity': !['polyline', 'points', 'skeleton'].includes(shapeType) || parentShapeType === 'skeleton' ? shapeOpacity : 0,
+        };
+    }
+
+    private getHighlightClassname(): string {
+        const { severity } = this.highlightedElements;
+        if (severity === HighlightSeverity.ERROR) {
+            return 'cvat_canvas_conflicted';
+        }
+        if (severity === HighlightSeverity.WARNING) {
+            return 'cvat_canvas_warned';
+        }
+        return '';
+    }
+
+    private updateObjects(states: any[]): void {
+        for (const state of states) {
+            const { clientID } = state;
+            const drawnState = this.drawnStates[clientID];
+            const shape = this.svgShapes[state.clientID];
+            const text = this.svgTexts[state.clientID];
+            const isInvisible = state.hidden || state.outside || this.isInnerHidden(state.clientID);
+
+            if (drawnState.hidden !== state.hidden || drawnState.outside !== state.outside) {
+                if (isInvisible) {
+                    (state.shapeType === 'points' ? shape.remember('_selectHandler').nested : shape).addClass(
+                        'cvat_canvas_hidden',
+                    );
+                    if (text) {
+                        text.addClass('cvat_canvas_hidden');
+                    }
+                } else {
+                    (state.shapeType === 'points' ? shape.remember('_selectHandler').nested : shape).removeClass(
+                        'cvat_canvas_hidden',
+                    );
+                    if (text) {
+                        text.removeClass('cvat_canvas_hidden');
+                        this.updateTextPosition(text);
+                    }
+                }
+            }
+
+            if (drawnState.zOrder !== state.zOrder) {
+                if (state.shapeType === 'points') {
+                    shape.remember('_selectHandler').nested.attr('data-z-order', state.zOrder);
+                } else {
+                    shape.attr('data-z-order', state.zOrder);
+                }
+            }
+
+            if (drawnState.occluded !== state.occluded) {
+                const instance = state.shapeType === 'points' ? this.svgShapes[clientID].remember('_selectHandler').nested : shape;
+                if (state.occluded) {
+                    instance.addClass('cvat_canvas_shape_occluded');
+                } else {
+                    instance.removeClass('cvat_canvas_shape_occluded');
+                }
+            }
+
+            if (drawnState.pinned !== state.pinned && this.activeElement.clientID !== null) {
+                const activeElement = { ...this.activeElement };
+                this.deactivate();
+                this.activate(activeElement);
+            }
+
+            if (drawnState.rotation) {
+                // need to rotate it back before changing points
+                shape.untransform();
+            }
+
+            const pointsUpdated = state.points.length !== drawnState.points.length ||
+                state.points.some((p: number, id: number): boolean => p !== drawnState.points[id]);
+
+            if (pointsUpdated) {
+                if (state.shapeType === 'mask') {
+                    // if masks points were updated, draw from scratch
+                    this.deleteObjects([this.drawnStates[+clientID]]);
+                    this.addObjects([state]);
+                    continue;
+                }
+
+                const translatedPoints: number[] = this.translateToCanvas(state.points);
+
+                if (state.shapeType === 'rectangle') {
+                    const [xtl, ytl, xbr, ybr] = translatedPoints;
+
+                    shape.attr({
+                        x: xtl,
+                        y: ytl,
+                        width: xbr - xtl,
+                        height: ybr - ytl,
+                    });
+                } else if (state.shapeType === 'ellipse') {
+                    const [cx, cy] = translatedPoints;
+                    const [rx, ry] = [translatedPoints[2] - cx, cy - translatedPoints[3]];
+                    shape.attr({
+                        cx, cy, rx, ry,
+                    });
+                } else {
+                    const stringified = stringifyPoints(translatedPoints);
+                    if (state.shapeType !== 'cuboid') {
+                        (shape as any).clear();
+                    }
+                    shape.attr('points', stringified);
+
+                    if (state.shapeType === 'points' && !isInvisible) {
+                        this.selectize(false, shape);
+                        this.setupPoints(shape as SVG.PolyLine, state);
+                    }
+                }
+            }
+
+            if (state.rotation) {
+                // now, when points changed, need to rotate it to new angle
+                shape.rotate(state.rotation);
+            }
+
+            const stateDescriptions = state.descriptions;
+            const drawnStateDescriptions = drawnState.descriptions;
+            const rotationUpdated = drawnState.rotation !== state.rotation;
+
+            if (
+                drawnState.label.id !== state.label.id ||
+                drawnState.zOrder !== state.zOrder ||
+                pointsUpdated ||
+                rotationUpdated ||
+                drawnStateDescriptions.length !== stateDescriptions.length ||
+                drawnStateDescriptions.some((desc: string, id: number): boolean => desc !== stateDescriptions[id])
+            ) {
+                // remove created text and create it again
+                if (text) {
+                    text.remove();
+                    this.updateTextPosition(this.addText(state));
+                }
+            } else {
+                const attrNames = Object.fromEntries(state.label.attributes.map((attr) => [attr.id, attr.name]));
+                // check if there are updates in attributes
+                for (const attrID of Object.keys(state.attributes)) {
+                    if (state.attributes[attrID] !== drawnState.attributes[+attrID]) {
+                        if (text) {
+                            const [span] = text.node.querySelectorAll<SVGTSpanElement>(`[attrID="${attrID}"]`);
+                            if (span && span.textContent) {
+                                span.textContent = `${attrNames[attrID]}: ${state.attributes[attrID]}`;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (
+                drawnState.label.id !== state.label.id ||
+                drawnState.group.id !== state.group.id ||
+                drawnState.group.color !== state.group.color ||
+                drawnState.color !== state.color
+            ) {
+                // update shape color if necessary
+                if (shape) {
+                    if (state.shapeType === 'mask') {
+                        // if masks points were updated, draw from scratch
+                        this.deleteObjects([this.drawnStates[+clientID]]);
+                        this.addObjects([state]);
+                        continue;
+                    } else if (state.shapeType === 'points') {
+                        const colorization = { ...this.getShapeColorization(state) };
+                        shape.remember('_selectHandler').nested.attr(colorization);
+                        shape.attr(colorization);
+                    } else {
+                        shape.attr({ ...this.getShapeColorization(state) });
+                    }
+                }
+            }
+
+            this.drawnStates[state.clientID] = this.saveState(state);
+        }
+    }
+
+    private deleteObjects(states: any[]): void {
+        for (const state of states) {
+            if (state.clientID in this.svgTexts) {
+                this.deleteText(state.clientID);
+            }
+
+            if (state.shapeType === 'skeleton') {
+                this.deleteObjects(state.elements);
+            }
+
+            if (state.clientID in this.svgShapes) {
+                const shape = this.svgShapes[state.clientID];
+                const { node } = shape;
+                shape.fire('remove');
+                shape.off('click');
+                shape.off('remove');
+                if (node instanceof SVGImageElement) {
+                    URL.revokeObjectURL(node.href.baseVal);
+                }
+                shape.remove();
+                delete this.svgShapes[state.clientID];
+            }
+
+            if (state.clientID in this.drawnStates) {
+                delete this.drawnStates[state.clientID];
+            }
+        }
+    }
+
+    private addObjects(states: any[]): void {
+        const { displayAllText } = this.configuration;
+        for (const state of states) {
+            const points: number[] = state.points as number[];
+
+            // TODO: Use enums after typification cvat-core
+            if (state.shapeType === 'mask') {
+                this.svgShapes[state.clientID] = this.addMask(points, state);
+            } else if (state.shapeType === 'skeleton') {
+                this.svgShapes[state.clientID] = this.addSkeleton(state);
+            } else {
+                const translatedPoints: number[] = this.translateToCanvas(points);
+                if (state.shapeType === 'rectangle') {
+                    this.svgShapes[state.clientID] = this.addRect(translatedPoints, state);
+                } else {
+                    const stringified = stringifyPoints(translatedPoints);
+
+                    if (state.shapeType === 'polygon') {
+                        this.svgShapes[state.clientID] = this.addPolygon(stringified, state);
+                    } else if (state.shapeType === 'polyline') {
+                        this.svgShapes[state.clientID] = this.addPolyline(stringified, state);
+                    } else if (state.shapeType === 'points') {
+                        this.svgShapes[state.clientID] = this.addPoints(stringified, state);
+                    } else if (state.shapeType === 'ellipse') {
+                        this.svgShapes[state.clientID] = this.addEllipse(stringified, state);
+                    } else if (state.shapeType === 'cuboid') {
+                        this.svgShapes[state.clientID] = this.addCuboid(stringified, state);
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
+            this.svgShapes[state.clientID].on('click.canvas', (): void => {
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.clicked', {
+                        bubbles: false,
+                        cancelable: true,
+                        detail: {
+                            state,
+                        },
+                    }),
+                );
+            });
+
+            if (displayAllText) {
+                this.addText(state);
+                this.updateTextPosition(this.svgTexts[state.clientID]);
+            }
+
+            this.drawnStates[state.clientID] = this.saveState(state);
+        }
+    }
+
+    private sortObjects(): void {
+        // TODO: Can be significantly optimized
+        const states = Array.from(this.content.getElementsByClassName('cvat_canvas_shape')).map((state: SVGElement): [
+            SVGElement,
+            number,
+        ] => [state, +state.getAttribute('data-z-order')]);
+
+        Array.from(this.content.getElementsByClassName('cvat_canvas_crosshair'))
+            .forEach((line: SVGLineElement): void => this.content.append(line));
+        Array.from(this.content.getElementsByClassName('cvat_interaction_point')).concat(
+            Array.from(this.content.getElementsByClassName('cvat_interaction_rectangle')),
+        ).forEach((interactionShape: SVGCircleElement): void => this.content.append(interactionShape));
+
+        const needSort = states.some((pair): boolean => pair[1] !== states[0][1]);
+        if (!states.length || !needSort) {
+            return;
+        }
+
+        const sorted = states.sort((a, b): number => a[1] - b[1]);
+        sorted.forEach((pair): void => {
+            this.content.appendChild(pair[0]);
+        });
+
+        this.content.prepend(...sorted.map((pair): SVGElement => pair[0]));
+    }
+
+    private deactivateAttribute(): void {
+        const { clientID, attributeID } = this.activeElement;
+        if (clientID !== null && attributeID !== null) {
+            const text = this.svgTexts[clientID];
+            if (text) {
+                const [span] = (text.node.querySelectorAll(`[attrID="${attributeID}"]`) as any) as SVGTSpanElement[];
+                if (span) {
+                    span.style.fill = '';
+                }
+            }
+
+            this.activeElement = {
+                ...this.activeElement,
+                attributeID: null,
+            };
+        }
+    }
+
+    private deactivateShape(): void {
+        if (this.activeElement.clientID) {
+            const { displayAllText } = this.configuration;
+            const { clientID } = this.activeElement;
+            const drawnState = this.drawnStates[clientID];
+            const shape = this.svgShapes[clientID];
+
+            if (drawnState.shapeType === 'points') {
+                this.svgShapes[clientID]
+                    .remember('_selectHandler').nested
+                    .removeClass('cvat_canvas_shape_activated');
+            } else {
+                shape.removeClass('cvat_canvas_shape_activated');
+            }
+
+            if (drawnState.shapeType === 'mask') {
+                shape.attr('opacity', `${Math.sqrt(this.configuration.shapeOpacity)}`);
+            } else {
+                shape.attr('fill-opacity', `${this.configuration.shapeOpacity}`);
+            }
+
+            if (!drawnState.pinned) {
+                // as resizable for skeletons uses "draggable" inside, it is important first to disable draggable
+                this.draggable(null, shape);
+            }
+
+            if (drawnState.shapeType !== 'mask') {
+                this.resizable(null, shape);
+            } else {
+                (shape as any).off('dblclick');
+            }
+
+            if (drawnState.shapeType !== 'points') {
+                this.selectize(false, shape);
+            }
+
+            if (drawnState.shapeType === 'cuboid') {
+                (shape as any).attr('projections', false);
+            }
+
+            // TODO: Hide text only if it is hidden by settings
+            const text = this.svgTexts[clientID];
+            if (text && !displayAllText) {
+                this.deleteText(clientID);
+            }
+
+            this.sortObjects();
+
+            this.activeElement = {
+                ...this.activeElement,
+                clientID: null,
+            };
+        }
+    }
+
+    private deactivate(): void {
+        this.deactivateAttribute();
+        this.deactivateShape();
+    }
+
+    private activateAttribute(clientID: number, attributeID: number): void {
+        const text = this.svgTexts[clientID];
+        if (text) {
+            const [span] = (text.node.querySelectorAll(`[attrID="${attributeID}"]`) as any) as SVGTSpanElement[];
+            if (span) {
+                span.style.fill = 'red';
+            }
+
+            this.activeElement = {
+                ...this.activeElement,
+                attributeID,
+            };
+        }
+    }
+
+    private activateShape(clientID: number): void {
+        const [state] = this.controller.objects.filter((_state: any): boolean => _state.clientID === clientID);
+        if (state && state.shapeType === 'points') {
+            this.svgShapes[clientID]
+                .remember('_selectHandler')
+                .nested.style('pointer-events', this.stateIsLocked(state) ? 'none' : '');
+        }
+
+        if (!state || state.hidden || state.outside) {
+            return;
+        }
+
+        const shape = this.svgShapes[clientID];
+        if (!this.svgTexts[clientID]) {
+            this.addText(state);
+        }
+        this.updateTextPosition(this.svgTexts[clientID]);
+
+        if (this.stateIsLocked(state)) {
+            return;
+        }
+
+        if (state.shapeType === 'points') {
+            this.svgShapes[clientID]
+                .remember('_selectHandler').nested
+                .addClass('cvat_canvas_shape_activated');
+        } else {
+            shape.addClass('cvat_canvas_shape_activated');
+        }
+
+        if (state.shapeType === 'mask') {
+            shape.attr('opacity', `${Math.sqrt(this.configuration.selectedShapeOpacity)}`);
+        } else {
+            shape.attr('fill-opacity', `${this.configuration.selectedShapeOpacity}`);
+        }
+
+        if (state.shapeType === 'points') {
+            this.content.append(this.svgShapes[clientID].remember('_selectHandler').nested.node);
+        } else {
+            this.content.append(shape.node);
+        }
+
+        const { showProjections } = this.configuration;
+        if (state.shapeType === 'cuboid' && showProjections) {
+            (shape as any).attr('projections', true);
+        }
+
+        if (state.shapeType !== 'points') {
+            this.selectize(true, shape);
+        }
+
+        const textList = [
+            state.clientID, ...state.elements.map((element: any): number => element.clientID),
+        ].map((id: number) => this.svgTexts[id]).filter((text: SVG.Text | undefined) => (
+            typeof text !== 'undefined'
+        ));
+
+        const hideText = (): void => {
+            textList.forEach((text: SVG.Text) => {
+                text.addClass('cvat_canvas_hidden');
+            });
+        };
+
+        const showText = (): void => {
+            textList.forEach((text: SVG.Text) => {
+                text.removeClass('cvat_canvas_hidden');
+                this.updateTextPosition(text);
+            });
+        };
+
+        if (state.shapeType !== 'mask') {
+            const showDirection = (): void => {
+                if (['polygon', 'polyline'].includes(state.shapeType)) {
+                    this.showDirection(state, shape as SVG.Polygon | SVG.PolyLine);
+                }
+            };
+
+            const hideDirection = (): void => {
+                if (['polygon', 'polyline'].includes(state.shapeType)) {
+                    this.hideDirection(shape as SVG.Polygon | SVG.PolyLine);
+                }
+            };
+
+            let shapeSizeElement: ShapeSizeElement | null = null;
+            this.resizable(state.shapeType === 'points' && state.pinned ? null : state, shape, () => {
+                this.mode = Mode.RESIZE;
+                hideDirection();
+                hideText();
+                if (state.shapeType === 'rectangle' || state.shapeType === 'ellipse') {
+                    shapeSizeElement = displayShapeSize(this.adoptedContent, this.adoptedText);
+                }
+            }, () => {
+                if (shapeSizeElement) {
+                    shapeSizeElement.update(shape);
+                }
+                this.updateSelectedObjectsOverlay();
+            }, () => {
+                this.mode = Mode.IDLE;
+                if (shapeSizeElement) {
+                    shapeSizeElement.rm();
+                    shapeSizeElement = null;
+                }
+
+                showDirection();
+                showText();
+            });
+
+            showDirection();
+        } else {
+            (shape as any).on('dblclick', (e: MouseEvent) => {
+                if (e.shiftKey) {
+                    this.controller.edit({ enabled: true, state });
+                    e.stopPropagation();
+                }
+            });
+        }
+
+        // A movable selected shape can drag the other movable members while
+        // locked, pinned, ground-truth, and skeleton members remain in place.
+        const partOfGroupSelection = this.selectedObjects.length > 1 &&
+            this.selectedObjectsSet.has(state.clientID);
+        const draggableBySelection = partOfGroupSelection && this.isStateMovableInSelection(state);
+        if ((!partOfGroupSelection && !state.pinned) || draggableBySelection) {
+            this.draggable(state, shape, () => {
+                this.mode = Mode.DRAG;
+                hideText();
+            }, () => {}, () => {
+                this.mode = Mode.IDLE;
+                showText();
+            });
+        }
+
+        this.canvas.dispatchEvent(
+            new CustomEvent('canvas.activated', {
+                bubbles: false,
+                cancelable: true,
+                detail: {
+                    state,
+                },
+            }),
+        );
+    }
+
+    private activate(activeElement: ActiveElement): void {
+        // Check if another element have been already activated
+        if (this.activeElement.clientID !== null) {
+            if (this.activeElement.clientID !== activeElement.clientID) {
+                // Deactivate previous shape and attribute
+                this.deactivate();
+            } else if (this.activeElement.attributeID !== activeElement.attributeID) {
+                this.deactivateAttribute();
+            }
+        }
+
+        const { clientID, attributeID } = activeElement;
+        if (clientID !== null && this.activeElement.clientID !== clientID) {
+            this.activateShape(clientID);
+            this.activeElement = {
+                ...this.activeElement,
+                clientID,
+            };
+        }
+
+        if (clientID !== null && attributeID !== null && this.activeElement.attributeID !== attributeID) {
+            this.activateAttribute(clientID, attributeID);
+        }
+    }
+
+    private highlight(highlightedElements: HighlightedElements): void {
+        this.highlightedElements.elementsIDs.forEach((clientID) => {
+            const shapeView = window.document.getElementById(`cvat_canvas_shape_${clientID}`);
+            if (shapeView) shapeView.classList.remove(this.getHighlightClassname());
+        });
+        const redrawMasks = (highlightedElements.elementsIDs.length !== 0 ||
+            this.highlightedElements.elementsIDs.length !== 0);
+
+        if (highlightedElements.elementsIDs.length) {
+            this.highlightedElements = { ...highlightedElements };
+            this.canvas.classList.add('cvat-canvas-highlight-enabled');
+            this.highlightedElements.elementsIDs.forEach((clientID) => {
+                const shapeView = window.document.getElementById(`cvat_canvas_shape_${clientID}`);
+                if (shapeView) shapeView.classList.add(this.getHighlightClassname());
+            });
+        } else {
+            this.highlightedElements = {
+                elementsIDs: [],
+                severity: null,
+            };
+            this.canvas.classList.remove('cvat-canvas-highlight-enabled');
+        }
+        if (redrawMasks) {
+            const masks = Object.values(this.drawnStates).filter((state) => state.shapeType === 'mask');
+            this.deleteObjects(masks);
+            this.addObjects(masks);
+        }
+        if (this.highlightedElements.elementsIDs.length) {
+            this.deactivate();
+            const clientID = this.highlightedElements.elementsIDs[0];
+            this.activate({ clientID, attributeID: null });
+        }
+    }
+
+    private clearSelectionPastePreview(): void {
+        this.cancelSelectionPreview();
+        this.finishSelectionPreviewShapes(this.selectionPasteShapes);
+        if (this.selectionPasteStates.length) {
+            this.deleteObjects(this.selectionPasteStates);
+        }
+        this.selectionPasteData = null;
+        this.selectionPasteStates = [];
+        this.selectionPasteOffset = { x: 0, y: 0 };
+        this.selectionPasteCenter = null;
+        this.selectionPasteStartedAt = 0;
+        this.selectionPasteShapes = [];
+    }
+
+    private renderSelectionPastePreview(): void {
+        if (!this.selectionPasteData || !this.selectionPasteStates.length ||
+            this.selectionPasteStates.every((state: any): boolean => !!this.svgShapes[state.clientID])) {
+            return;
+        }
+
+        this.finishSelectionPreviewShapes(this.selectionPasteShapes);
+        this.addObjects(this.selectionPasteStates);
+        this.selectionPasteShapes = this.prepareSelectionPreviewShapes(this.selectionPasteStates);
+        const boxes = this.selectionPasteStates
+            .map((state: any): SVG.RBox | null => this.svgShapes[state.clientID]?.rbox(this.adoptedContent) || null)
+            .filter((box: SVG.RBox | null): box is SVG.RBox => box !== null);
+        if (!boxes.length) {
+            return;
+        }
+
+        const left = Math.min(...boxes.map((box: SVG.RBox): number => box.x));
+        const top = Math.min(...boxes.map((box: SVG.RBox): number => box.y));
+        const right = Math.max(...boxes.map((box: SVG.RBox): number => box.x2));
+        const bottom = Math.max(...boxes.map((box: SVG.RBox): number => box.y2));
+        this.selectionPasteCenter = {
+            x: (left + right) / 2,
+            y: (top + bottom) / 2,
+        };
+
+        for (const state of this.selectionPasteStates) {
+            const shape = this.svgShapes[state.clientID];
+            shape?.addClass('cvat_canvas_shape_drawing cvat_canvas_shape_pasting').attr('pointer-events', 'none');
+            if (state.shapeType === 'points') {
+                shape?.remember('_selectHandler')?.nested?.addClass('cvat_canvas_shape_pasting');
+            }
+            if (this.svgTexts[state.clientID]) {
+                this.deleteText(state.clientID);
+            }
+        }
+        if (this.selectionPasteOffset.x || this.selectionPasteOffset.y) {
+            this.moveSelectionPreviewShapes(
+                this.selectionPasteShapes, this.selectionPasteOffset.x, this.selectionPasteOffset.y,
+            );
+        }
+    }
+
+    private startSelectionPaste(data: DrawData): void {
+        this.clearSelectionPastePreview();
+        this.selectionPasteData = data;
+        this.selectionPasteStates = data.initialStates || [];
+        this.selectionPasteStartedAt = Date.now();
+        this.renderSelectionPastePreview();
+    }
+
+    private moveSelectionPastePreview(clientX: number, clientY: number): void {
+        if (!this.selectionPasteData || !this.selectionPasteCenter) {
+            return;
+        }
+
+        this.scheduleSelectionPreview(() => this.renderSelectionPastePosition(clientX, clientY));
+    }
+
+    private renderSelectionPastePosition(clientX: number, clientY: number): void {
+        if (!this.selectionPasteData || !this.selectionPasteCenter) return;
+        const [x, y] = translateToSVG(
+            this.content,
+            [clientX, clientY],
+        );
+        const dx = x - this.selectionPasteCenter.x - this.selectionPasteOffset.x;
+        const dy = y - this.selectionPasteCenter.y - this.selectionPasteOffset.y;
+        if (!dx && !dy) {
+            return;
+        }
+
+        this.selectionPasteOffset.x += dx;
+        this.selectionPasteOffset.y += dy;
+        this.moveSelectionPreviewShapes(
+            this.selectionPasteShapes, this.selectionPasteOffset.x, this.selectionPasteOffset.y,
+        );
+    }
+
+    private placeSelectionPaste(event: MouseEvent): void {
+        if (!this.selectionPasteData || !this.selectionPasteStates.length) {
+            return;
+        }
+
+        // A click can arrive before the scheduled preview, or without a preceding mousemove.
+        this.cancelSelectionPreview();
+        this.renderSelectionPastePosition(event.clientX, event.clientY);
+        this.selectionPasteData.onDrawDone?.(
+            { offset: { ...this.selectionPasteOffset } },
+            Date.now() - this.selectionPasteStartedAt,
+            event.ctrlKey,
+            this.selectionPasteData,
+        );
+        this.selectionPasteStartedAt = Date.now();
+        if (!event.ctrlKey) {
+            this.controller.draw({ enabled: false });
+        }
+    }
+
+    private translateStatePoints(state: any, dx: number, dy: number): number[] {
+        const points = [...state.points];
+        if (state.shapeType === 'mask') {
+            // mask points are [...rle, left, top, right, bottom]; shift the bounding box
+            const n = points.length;
+            const shiftX = Math.round(dx);
+            const shiftY = Math.round(dy);
+            points[n - 4] += shiftX;
+            points[n - 3] += shiftY;
+            points[n - 2] += shiftX;
+            points[n - 1] += shiftY;
+            return points;
+        }
+
+        for (let i = 0; i < points.length; i += 2) {
+            points[i] += dx;
+            points[i + 1] += dy;
+        }
+        return points;
+    }
+
+    private scheduleSelectionPreview(update: () => void): void {
+        this.selectionPreviewUpdate = update;
+        if (this.selectionPreviewFrame === null) {
+            this.selectionPreviewFrame = window.requestAnimationFrame(() => {
+                this.selectionPreviewFrame = null;
+                this.flushSelectionPreview();
+            });
+        }
+    }
+
+    private flushSelectionPreview(): void {
+        const update = this.selectionPreviewUpdate;
+        this.cancelSelectionPreview();
+        update?.();
+    }
+
+    private cancelSelectionPreview(): void {
+        if (this.selectionPreviewFrame !== null) {
+            window.cancelAnimationFrame(this.selectionPreviewFrame);
+        }
+        this.selectionPreviewFrame = null;
+        this.selectionPreviewUpdate = null;
+    }
+
+    private prepareSelectionPreviewShapes(states: any[]): SelectionPreviewShape[] {
+        return states.filter((state) => !!this.svgShapes[state.clientID]).map((state) => {
+            const shape = this.svgShapes[state.clientID];
+            const controlShape = state.shapeType === 'skeleton' ?
+                (shape as SVG.G).children().find((child: SVG.Element) => child.type === 'rect') : shape;
+            const selectionHandler: SelectionPreviewHandler | undefined = controlShape?.remember('_selectHandler');
+            const elements: SVG.Element[] = [shape];
+            if (selectionHandler?.nested && !shape.node.contains(selectionHandler.nested.node)) {
+                elements.push(selectionHandler.nested);
+            }
+
+            // Translations do not change local geometry. Move the controls as a unit instead
+            // of letting their observer measure bounds and walk every vertex each frame.
+            selectionHandler?.observerInst?.disconnect();
+            return {
+                shape,
+                rotation: state.rotation || 0,
+                selectionHandler,
+                transforms: elements.map((element) => ({
+                    element,
+                    matrix: new SVG.Matrix(element),
+                    original: element.node.getAttribute('transform'),
+                })),
+            };
+        });
+    }
+
+    private moveSelectionPreviewShapes(shapes: SelectionPreviewShape[], dx: number, dy: number): void {
+        for (const { transforms } of shapes) {
+            for (const { element, matrix } of transforms) {
+                element.node.setAttribute('transform',
+                    `matrix(${matrix.a} ${matrix.b} ${matrix.c} ${matrix.d} ${matrix.e + dx} ${matrix.f + dy})`);
+            }
+        }
+    }
+
+    private finishSelectionPreviewShapes(shapes: SelectionPreviewShape[], dx = 0, dy = 0): void {
+        for (const {
+            shape, rotation, transforms, selectionHandler,
+        } of shapes) {
+            for (const { element, original } of transforms) {
+                if (original === null) element.node.removeAttribute('transform');
+                else element.node.setAttribute('transform', original);
+            }
+            if (dx || dy) {
+                // Apply the original geometry movement once on drop, not during the preview.
+                if (rotation) shape.rotate(0);
+                shape.dmove(dx, dy);
+                if (rotation) shape.rotate(rotation);
+            }
+            if (selectionHandler?.nested?.node.isConnected && selectionHandler.el.node.isConnected) {
+                selectionHandler.handler();
+                selectionHandler.observe();
+            }
+        }
+    }
+
+    private isStateMovableInSelection(state: any): boolean {
+        return !!state && !state.lock && !state.pinned && !state.isGroundTruth &&
+            !state.hidden && !state.outside && !this.isInnerHidden(state.clientID);
+    }
+
+    private getMovableSelectedStates(): any[] {
+        return this.controller.objects
+            .filter((state: any): boolean => (
+                this.selectedObjectsSet.has(state.clientID) && this.isStateMovableInSelection(state)
+            ));
+    }
+
+    private hasMovableSelectedObjects(): boolean {
+        return this.controller.objects.some((state: any): boolean => (
+            this.selectedObjectsSet.has(state.clientID) && this.isStateMovableInSelection(state)
+        ));
+    }
+
+    private normalizeSelectionTranslation(includesMask: boolean, dx: number, dy: number): { dx: number; dy: number } {
+        return includesMask ? { dx: Math.round(dx), dy: Math.round(dy) } : { dx, dy };
+    }
+
+    private setSelectedObjectsOverlayDragging(dragging: boolean): void {
+        this.selectedObjectsBox?.node.classList.toggle('cvat_canvas_selected_objects_box_dragging', dragging);
+        this.selectedObjectsBoxBitmap?.node.classList.toggle('cvat_canvas_selected_objects_box_dragging', dragging);
+        this.selectedObjectsLabel?.classList.toggle('cvat_canvas_selected_objects_label_dragging', dragging);
+    }
+
+    private clearSelectedObjectsOverlay(): void {
+        this.selectedObjectsBox?.remove();
+        this.selectedObjectsBoxBitmap?.parent().remove();
+        this.selectedObjectsLabel?.remove();
+        this.selectedObjectsBox = null;
+        this.selectedObjectsBoxBitmap = null;
+        this.selectedObjectsLabel = null;
+    }
+
+    private makeSelectedObjectsBoxDraggable(): void {
+        if (!this.selectedObjectsBox) {
+            return;
+        }
+
+        let startedAt = 0;
+        let startPointer: { x: number; y: number } | null = null;
+        let renderedOffset = { x: 0, y: 0 };
+        let movableStates: any[] = [];
+        let previewShapes: SelectionPreviewShape[] = [];
+        let includesMask = false;
+        let dragging = false;
+        let moved = false;
+
+        (this.selectedObjectsBox as any).draggable();
+        this.selectedObjectsBox.on('contextmenu', (event: MouseEvent): void => {
+            event.preventDefault();
+            event.stopPropagation();
+            this.openSelectedObjectsMenu(event.clientX, event.clientY);
+        }).on('beforedrag', (event: CustomEvent): void => {
+            const sourceEvent = event.detail.event as MouseEvent;
+            sourceEvent.stopPropagation();
+            if (this.isMultiSelectModifierPressed(sourceEvent) ||
+                this.isMultiSelectObjectModifierPressed(sourceEvent) ||
+                !this.hasMovableSelectedObjects()) {
+                sourceEvent.preventDefault();
+                event.preventDefault();
+            }
+        }).on('dragstart', (event: CustomEvent): void => {
+            const { p } = event.detail;
+            this.closeSelectedObjectsMenu();
+            dragging = true;
+            movableStates = this.getMovableSelectedStates();
+            previewShapes = this.prepareSelectionPreviewShapes(movableStates);
+            includesMask = movableStates.some((state) => state.shapeType === 'mask');
+            startPointer = { x: p.x, y: p.y };
+            renderedOffset = { x: 0, y: 0 };
+            startedAt = Date.now();
+            moved = false;
+            this.setSelectedObjectsOverlayDragging(true);
+            this.cancelSelectionDrag = (): void => {
+                dragging = false;
+                this.cancelSelectionDrag = null;
+                this.cancelSelectionPreview();
+                this.finishSelectionPreviewShapes(previewShapes);
+                previewShapes = [];
+                for (const state of movableStates) this.resetViewPosition(state.clientID);
+                this.setSelectedObjectsOverlayDragging(false);
+                window.dispatchEvent(new MouseEvent('mouseup'));
+                this.updateSelectedObjectsOverlay();
+            };
+        }).on('dragmove', (event: CustomEvent): void => {
+            event.preventDefault();
+            if (!dragging || !startPointer) {
+                return;
+            }
+
+            const { p } = event.detail;
+            const offset = { x: p.x - startPointer.x, y: p.y - startPointer.y };
+            moved ||= offset.x !== 0 || offset.y !== 0;
+            this.scheduleSelectionPreview(() => {
+                const dx = offset.x - renderedOffset.x;
+                const dy = offset.y - renderedOffset.y;
+                if (!dx && !dy) return;
+                this.selectedObjectsBox?.dmove(dx, dy);
+                this.moveSelectionPreviewShapes(previewShapes, offset.x, offset.y);
+                renderedOffset = offset;
+            });
+        }).on('dragend', (event: CustomEvent): void => {
+            if (!dragging || !startPointer || !this.selectedObjectsBox) {
+                return;
+            }
+
+            this.flushSelectionPreview();
+            this.cancelSelectionDrag = null;
+            const rawDx = renderedOffset.x;
+            const rawDy = renderedOffset.y;
+            const { dx, dy } = this.normalizeSelectionTranslation(includesMask, rawDx, rawDy);
+            const correctionX = dx - rawDx;
+            const correctionY = dy - rawDy;
+            if (correctionX || correctionY) {
+                this.selectedObjectsBox.dmove(correctionX, correctionY);
+            }
+            this.finishSelectionPreviewShapes(previewShapes, dx, dy);
+            if (dx !== 0 || dy !== 0) {
+                const movedStates = movableStates.map((state: any) => ({
+                    state,
+                    points: this.translateStatePoints(state, dx, dy),
+                }));
+
+                movedStates.forEach(({ state }) => this.markStateEdited(state));
+                this.canvas.dispatchEvent(
+                    new CustomEvent('canvas.groupmoved', {
+                        bubbles: false,
+                        cancelable: true,
+                        detail: {
+                            states: movedStates,
+                            duration: Date.now() - startedAt,
+                        },
+                    }),
+                );
+            } else if (!moved && this.mode === Mode.SELECT) {
+                this.onFindObject(event.detail.event);
+            }
+
+            dragging = false;
+            moved = false;
+            movableStates = [];
+            previewShapes = [];
+            startPointer = null;
+            this.setSelectedObjectsOverlayDragging(false);
+            this.updateSelectedObjectsOverlay();
+        });
+    }
+
+    private openSelectedObjectsMenu(left: number, top: number): void {
+        this.canvas.dispatchEvent(new CustomEvent('canvas.selectionmenu', {
+            bubbles: true,
+            cancelable: true,
+            detail: {
+                left,
+                top,
+            },
+        }));
+    }
+
+    private closeSelectedObjectsMenu(): void {
+        this.canvas.dispatchEvent(new CustomEvent('canvas.selectionmenu', {
+            bubbles: false,
+            cancelable: true,
+            detail: { close: true },
+        }));
+    }
+
+    private updateSelectedObjectsLabelPosition(): void {
+        if (!this.selectedObjectsBox || !this.selectedObjectsLabel ||
+            this.selectedObjectsLabel.classList.contains('cvat_canvas_selected_objects_label_dragging')) {
+            return;
+        }
+
+        const canvasBox = this.canvas.getBoundingClientRect();
+        const selectionBox = this.selectedObjectsBox.node.getBoundingClientRect();
+        const { offsetWidth: labelWidth, offsetHeight: labelHeight } = this.selectedObjectsLabel;
+        const selectionTop = selectionBox.top - canvasBox.top;
+        const selectionLeft = selectionBox.left - canvasBox.left;
+        const top = selectionTop >= labelHeight ? selectionTop - labelHeight : selectionTop;
+
+        this.selectedObjectsLabel.style.top = `${clamp(top, 0, this.canvas.clientHeight - labelHeight)}px`;
+        this.selectedObjectsLabel.style.left = `${clamp(
+            selectionLeft,
+            0,
+            this.canvas.clientWidth - labelWidth,
+        )}px`;
+    }
+
+    private updateSelectedObjectsOverlay(): void {
+        const selectedShapes = this.selectedObjects
+            .map((clientID: number): SVG.Shape | null => {
+                const state = this.drawnStates[clientID];
+                return state && !state.hidden && !state.outside && !this.isInnerHidden(clientID) ?
+                    this.svgShapes[clientID] || null : null;
+            })
+            .filter((shape: SVG.Shape | null): shape is SVG.Shape => Boolean(shape?.node.isConnected));
+
+        if (!selectedShapes.length) {
+            this.clearSelectedObjectsOverlay();
+            return;
+        }
+
+        const boxes = selectedShapes.map((shape: SVG.Shape): SVG.RBox => shape.rbox(this.adoptedContent));
+        const left = Math.min(...boxes.map((box: SVG.RBox): number => box.x));
+        const top = Math.min(...boxes.map((box: SVG.RBox): number => box.y));
+        const right = Math.max(...boxes.map((box: SVG.RBox): number => box.x2));
+        const bottom = Math.max(...boxes.map((box: SVG.RBox): number => box.y2));
+        const padding = SELECTED_OBJECTS_BOX_PADDING / this.geometry.scale;
+
+        if (!this.selectedObjectsBox) {
+            this.selectedObjectsBox = this.adoptedContent
+                .rect(right - left, bottom - top)
+                .addClass('cvat_canvas_selected_objects_box');
+            this.makeSelectedObjectsBoxDraggable();
+
+            // Keep hit testing in the content SVG; only mirror the outline above the bitmap.
+            const overlay = SVG.adopt(
+                window.document.createElementNS('http://www.w3.org/2000/svg', 'svg') as unknown as HTMLElement,
+            ) as SVG.Container;
+            overlay.addClass('cvat_canvas_selection_overlay');
+            this.attachmentBoard.appendChild(overlay.node);
+            this.selectedObjectsBoxBitmap = overlay
+                .rect(right - left, bottom - top)
+                .addClass('cvat_canvas_selected_objects_box_bitmap');
+        }
+
+        for (const box of [this.selectedObjectsBox, this.selectedObjectsBoxBitmap]) {
+            box?.move(left - padding, top - padding)
+                .size(right - left + padding * 2, bottom - top + padding * 2)
+                .attr('stroke-width', SELECTED_OBJECTS_BOX_STROKE_WIDTH / this.geometry.scale)
+                .front();
+        }
+        this.selectedObjectsBox.node.classList.toggle(
+            'cvat_canvas_selected_objects_box_not_draggable',
+            !this.hasMovableSelectedObjects(),
+        );
+
+        this.selectedObjectsBox.node.setAttribute('aria-label', 'Move selection');
+
+        if (!this.selectedObjectsLabel) {
+            const label = window.document.createElement('div');
+            const title = window.document.createElement('span');
+
+            label.className = 'cvat_canvas_selected_objects_label';
+            title.className = 'cvat_canvas_selected_objects_label_title';
+            label.addEventListener('mousedown', (event: MouseEvent): void => {
+                if ((event.target as Element).closest('.cvat-canvas-selected-objects-menu-content')) {
+                    event.stopPropagation();
+                    return;
+                }
+                if (event.button !== 0) {
+                    return;
+                }
+
+                event.preventDefault();
+                event.stopPropagation();
+                if (this.isMultiSelectModifierPressed(event) || this.isMultiSelectObjectModifierPressed(event) ||
+                    !this.hasMovableSelectedObjects() || !this.selectedObjectsBox) {
+                    return;
+                }
+
+                this.selectedObjectsBox.node.dispatchEvent(new MouseEvent('mousedown', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    button: 0,
+                    buttons: 1,
+                    clientX: event.clientX,
+                    clientY: event.clientY,
+                    screenX: event.screenX,
+                    screenY: event.screenY,
+                }));
+            });
+            for (const eventName of ['pointerdown', 'click']) {
+                label.addEventListener(eventName, (event: Event): void => {
+                    if ((event.target as Element).closest('.cvat-canvas-selected-objects-menu-content')) {
+                        event.stopPropagation();
+                    }
+                });
+            }
+            label.append(title);
+            this.canvas.appendChild(label);
+            this.selectedObjectsLabel = label;
+        }
+        this.selectedObjectsLabel.classList.toggle(
+            'cvat_canvas_selected_objects_label_not_draggable',
+            !this.hasMovableSelectedObjects(),
+        );
+
+        const title = this.selectedObjectsLabel.querySelector('.cvat_canvas_selected_objects_label_title');
+        if (title) {
+            title.textContent = `SELECTION (${this.selectedObjects.length})`;
+        }
+        this.selectedObjectsLabel.title = '';
+        this.updateSelectedObjectsLabelPosition();
+    }
+
+    private setupSelectedObjects(): void {
+        // Reflect the persistent multi-selection on the shapes with a dedicated class.
+        for (const shape of Array.from(
+            this.content.getElementsByClassName('cvat_canvas_shape_selected_object'),
+        )) {
+            shape.classList.remove('cvat_canvas_shape_selected_object');
+            (shape as SVGElement).style.removeProperty('--cvat-selection-opacity');
+            (shape as SVGElement).style.removeProperty('--cvat-selection-mask-opacity');
+            (shape as SVGElement).style.removeProperty('--cvat-selection-stroke-width');
+            (shape as SVGElement).style.removeProperty('--cvat-selection-point-stroke-width');
+        }
+
+        const selectedShapeOpacity = this.configuration.selectedShapeOpacity ?? 0.5;
+        for (const clientID of this.selectedObjects) {
+            const shape = this.svgShapes[clientID];
+            const state = this.drawnStates[clientID];
+            const visualShape = state?.shapeType === 'points' ? shape?.remember('_selectHandler')?.nested?.node : shape?.node;
+            if (!visualShape?.isConnected) continue;
+
+            visualShape.classList.add('cvat_canvas_shape_selected_object');
+            visualShape.style.setProperty('--cvat-selection-opacity', `${selectedShapeOpacity}`);
+            visualShape.style.setProperty('--cvat-selection-mask-opacity', `${Math.sqrt(selectedShapeOpacity)}`);
+        }
+
+        this.updateSelectedObjectsOverlay();
+    }
+
+    // Update text position after corresponding box has been moved, resized, etc.
+    private updateTextPosition(
+        text: SVG.Text,
+        options: { rotation?: { angle: number, cx: number, cy: number } } = {},
+    ): void {
+        const clientID = text.attr('data-client-id');
+        if (!Number.isInteger(clientID)) return;
+        const shape = this.svgShapes[clientID];
+        if (!shape) return;
+
+        if (text.node.style.display === 'none') return; // wrong transformation matrix
+        const { textFontSize } = this.configuration;
+        let { textPosition } = this.configuration;
+        if (shape.type === 'circle') {
+            // force auto for skeleton elements
+            textPosition = 'auto';
+        }
+
+        text.untransform();
+        text.style({ 'font-size': `${textFontSize}px` });
+        const rotation = options.rotation?.angle || getRoundedRotation(shape);
+
+        // Find the best place for a text
+        let [clientX, clientY, clientCX, clientCY]: number[] = [0, 0, 0, 0];
+        if (textPosition === 'center') {
+            let cx = 0;
+            let cy = 0;
+            if (['rect', 'image'].includes(shape.type)) {
+                // for rectangle/mask finding a center is simple
+                cx = +shape.attr('x') + +shape.attr('width') / 2;
+                cy = +shape.attr('y') + +shape.attr('height') / 2;
+            } else if (shape.type === 'g') {
+                ({ cx, cy } = shape.bbox());
+            } else if (shape.type === 'ellipse') {
+                // even simpler for ellipses
+                cx = +shape.attr('cx');
+                cy = +shape.attr('cy');
+            } else {
+                // for polyshapes we use special algorithm
+                const points = parsePoints(pointsToNumberArray(shape.attr('points')));
+                [cx, cy] = polylabel([points.map((point) => [point.x, point.y])]);
+            }
+
+            [clientX, clientY] = translateFromSVG(this.content, [cx, cy]);
+            // center is exactly clientX, clientY
+            clientCX = clientX;
+            clientCY = clientY;
+        } else {
+            let box = (shape.node as any).getBBox();
+
+            // Translate the whole box to the client coordinate system
+            const [x1, y1, x2, y2]: number[] = translateFromSVG(this.content, [
+                box.x,
+                box.y,
+                box.x + box.width,
+                box.y + box.height,
+            ]);
+
+            clientCX = x1 + (x2 - x1) / 2;
+            clientCY = y1 + (y2 - y1) / 2;
+
+            box = {
+                x: Math.min(x1, x2),
+                y: Math.min(y1, y2),
+                width: Math.max(x1, x2) - Math.min(x1, x2),
+                height: Math.max(y1, y2) - Math.min(y1, y2),
+            };
+
+            // first try to put to the top right corner
+            [clientX, clientY] = [box.x + box.width, box.y];
+            if (
+                clientX + ((text.node as any) as SVGTextElement)
+                    .getBBox().width + consts.TEXT_MARGIN > this.canvas.offsetWidth
+            ) {
+                // if out of visible area, try to put text to top left corner
+                [clientX, clientY] = [box.x, box.y];
+            }
+        }
+
+        // Translate found coordinates to text SVG
+        const [x, y, rotX, rotY]: number[] = translateToSVG(this.text, [
+            clientX + (textPosition === 'auto' ? consts.TEXT_MARGIN : 0),
+            clientY + (textPosition === 'auto' ? consts.TEXT_MARGIN : 0),
+            options.rotation?.cx || clientCX,
+            options.rotation?.cy || clientCY,
+        ]);
+
+        const textBBox = ((text.node as any) as SVGTextElement).getBBox();
+        // Finally draw a text
+        if (textPosition === 'center') {
+            text.move(x - textBBox.width / 2, y - textBBox.height / 2);
+        } else {
+            text.move(x, y);
+        }
+
+        let childOptions = {};
+        if (rotation) {
+            text.rotate(rotation, rotX, rotY);
+            childOptions = {
+                rotation: {
+                    angle: rotation,
+                    cx: clientCX,
+                    cy: clientCY,
+                },
+            };
+        }
+
+        if (clientID in this.drawnStates && this.drawnStates[clientID].shapeType === 'skeleton') {
+            this.drawnStates[clientID].elements.forEach((element: DrawnState) => {
+                if (element.clientID in this.svgTexts) {
+                    this.updateTextPosition(this.svgTexts[element.clientID], childOptions);
+                }
+            });
+        }
+
+        function applyParentX(parentText: SVGTSpanElement | SVGTextElement): void {
+            for (let i = 0; i < parentText.children.length; i++) {
+                if (i === 0) {
+                    // do not align the first child
+                    continue;
+                }
+
+                const tspan = parentText.children[i];
+                tspan.setAttribute('x', parentText.getAttribute('x'));
+                applyParentX(tspan as SVGTSpanElement);
+            }
+        }
+
+        applyParentX(text.node as any as SVGTextElement);
+    }
+
+    private deleteText(clientID: number): void {
+        if (clientID in this.svgTexts) {
+            this.svgTexts[clientID].remove();
+            delete this.svgTexts[clientID];
+        }
+
+        if (clientID in this.drawnStates && this.drawnStates[clientID].shapeType === 'skeleton') {
+            this.drawnStates[clientID].elements.forEach((element) => {
+                this.deleteText(element.clientID);
+            });
+        }
+    }
+
+    private addText(state: any, options: { textContent?: string, isSkeletonElement?: boolean } = {}): SVG.Text {
+        const { undefinedAttrValue } = this.configuration;
+        const content = options.textContent || this.configuration.textContent;
+        const withID = content.includes('id');
+        const withAttr = content.includes('attributes');
+        const withLabel = content.includes('label');
+        const withSource = content.includes('source');
+        const withDescriptions = content.includes('descriptions');
+        const withDimensions = content.includes('dimensions');
+        const withLayer = content.includes('layer') || content.includes('zOrder');
+
+        const textFontSize = this.configuration.textFontSize || 12;
+        const {
+            label, clientID, attributes, source, descriptions, score, votes, zOrder,
+        } = state;
+        const isConsensus = source === 'consensus';
+        const withScore = isConsensus && !options.isSkeletonElement;
+        const withVotes = isConsensus && !options.isSkeletonElement;
+
+        const attrNames = Object.fromEntries(state.label.attributes.map((attr) => [attr.id, attr.name]));
+        if (state.shapeType === 'skeleton') {
+            const visibleElementIDs = this.getVisibleSkeletonElementIDs(state.clientID);
+            state.elements.forEach((element: any) => {
+                if (visibleElementIDs && !visibleElementIDs.has(element.clientID)) {
+                    return;
+                }
+
+                if (!(element.clientID in this.svgTexts)) {
+                    this.svgTexts[element.clientID] = this.addText(element, {
+                        textContent: [
+                            ...(withLabel ? ['label'] : []),
+                            ...(withAttr ? ['attributes'] : []),
+                            // Note: explicitly exclude 'layer', 'score' and 'votes' for skeleton elements
+                        ].join(',') || ' ',
+                        isSkeletonElement: true,
+                    });
+                }
+            });
+        }
+
+        this.svgTexts[state.clientID] = this.adoptedText
+            .text((block): void => {
+                block.tspan(`${withLabel ? label.name : ''} ` +
+                `${withID ? clientID : ''} ` +
+                `${withSource ? `(${source})` : ''}`).style({
+                    'text-transform': 'uppercase',
+                });
+
+                if (withLayer) {
+                    block
+                        .tspan(`Layer: ${zOrder}`)
+                        .attr({
+                            dy: '1.25em',
+                            x: 0,
+                        })
+                        .addClass('cvat_canvas_text_layer');
+                }
+
+                if (withDimensions && ['rectangle', 'ellipse'].includes(state.shapeType)) {
+                    let width = state.points[2] - state.points[0];
+                    let height = state.points[3] - state.points[1];
+
+                    if (state.shapeType === 'ellipse') {
+                        width *= 2;
+                        height *= -2;
+                    }
+
+                    block
+                        .tspan(composeShapeDimensions(width, height, state.rotation))
+                        .attr({
+                            dy: '1.25em',
+                            x: 0,
+                        })
+                        .addClass('cvat_canvas_text_dimensions');
+                }
+                if (withDescriptions) {
+                    descriptions.forEach((desc: string, idx: number) => {
+                        block
+                            .tspan(`${desc}`)
+                            .attr({
+                                dy: idx === 0 ? '1.25em' : '1em',
+                                x: 0,
+                            })
+                            .addClass('cvat_canvas_text_description');
+                    });
+                }
+                if (withScore || withVotes) {
+                    const parts = [];
+                    if (withScore) {
+                        parts.push(`Score: ${score.toFixed(2)}`);
+                    }
+                    if (withVotes) {
+                        parts.push(`Votes: ${votes}`);
+                    }
+                    block
+                        .tspan(parts.join(', '))
+                        .attr({ dy: '1.25em', x: 0 })
+                        .addClass('cvat_canvas_text_score');
+                }
+                if (withAttr) {
+                    Object.keys(attributes).forEach((attrID: string, idx: number) => {
+                        const values = `${attributes[attrID] === undefinedAttrValue ?
+                            '' : attributes[attrID]}`.split('\n');
+                        const parent = block.tspan(`${attrNames[attrID]}: `)
+                            .attr({ attrID, dy: idx === 0 ? '1.25em' : '1em', x: 0 })
+                            .addClass('cvat_canvas_text_attribute');
+                        values.forEach((attrLine: string, index: number) => {
+                            parent
+                                .tspan(attrLine)
+                                .attr({
+                                    dy: index === 0 ? 0 : '1em',
+                                });
+                        });
+                    });
+                }
+            })
+            .move(0, 0)
+            .attr({ 'data-client-id': state.clientID })
+            .style({ 'font-size': textFontSize })
+            .addClass('cvat_canvas_text');
+
+        return this.svgTexts[state.clientID];
+    }
+
+    private addRect(points: number[], state: any): SVG.Rect {
+        const [xtl, ytl, xbr, ybr] = points;
+        const rect = this.adoptedContent
+            .rect()
+            .size(xbr - xtl, ybr - ytl)
+            .attr({
+                clientID: state.clientID,
+                'color-rendering': 'optimizeQuality',
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                'data-z-order': state.zOrder,
+                ...this.getShapeColorization(state),
+            }).move(xtl, ytl).addClass('cvat_canvas_shape');
+
+        if (state.rotation) {
+            rect.rotate(state.rotation);
+        }
+
+        if (state.occluded) {
+            rect.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            rect.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.isGroundTruth) {
+            rect.addClass('cvat_canvas_ground_truth');
+        }
+
+        return rect;
+    }
+
+    private addPolygon(points: string, state: any): SVG.Polygon {
+        const polygon = this.adoptedContent
+            .polygon(points)
+            .attr({
+                clientID: state.clientID,
+                'color-rendering': 'optimizeQuality',
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                'data-z-order': state.zOrder,
+                ...this.getShapeColorization(state),
+            }).addClass('cvat_canvas_shape');
+
+        if (state.occluded) {
+            polygon.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            polygon.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.isGroundTruth) {
+            polygon.addClass('cvat_canvas_ground_truth');
+        }
+
+        return polygon;
+    }
+
+    private addPolyline(points: string, state: any): SVG.PolyLine {
+        const polyline = this.adoptedContent
+            .polyline(points)
+            .attr({
+                clientID: state.clientID,
+                'color-rendering': 'optimizeQuality',
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                'data-z-order': state.zOrder,
+                ...this.getShapeColorization(state),
+            }).addClass('cvat_canvas_shape');
+
+        if (state.occluded) {
+            polyline.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            polyline.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.isGroundTruth) {
+            polyline.addClass('cvat_canvas_ground_truth');
+        }
+
+        return polyline;
+    }
+
+    private addCuboid(points: string, state: any): any {
+        const cube = (this.adoptedContent as any)
+            .cube(points)
+            .fill(state.color)
+            .attr({
+                clientID: state.clientID,
+                'color-rendering': 'optimizeQuality',
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                'data-z-order': state.zOrder,
+                ...this.getShapeColorization(state),
+            }).addClass('cvat_canvas_shape');
+
+        if (state.occluded) {
+            cube.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            cube.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.isGroundTruth) {
+            cube.addClass('cvat_canvas_ground_truth');
+        }
+
+        return cube;
+    }
+
+    private addMask(points: number[], state: any): SVG.Image {
+        const colorization = this.getShapeColorization(state);
+        const color = fabric.Color.fromHex(colorization.fill).getSource();
+        const [left, top, right, bottom] = points.slice(-4);
+        const width = right - left + 1;
+        const height = bottom - top + 1;
+        const imageBitmap = RLEToImageData(color[0], color[1], color[2], points);
+
+        const image = this.adoptedContent.image().attr({
+            clientID: state.clientID,
+            'color-rendering': 'optimizeQuality',
+            id: `cvat_canvas_shape_${state.clientID}`,
+            'shape-rendering': 'geometricprecision',
+            'data-z-order': state.zOrder,
+            // apply sqrt function to colorization to enhance displaying the mask on the canvas
+            opacity: Math.sqrt(colorization['fill-opacity']),
+            stroke: colorization.stroke,
+        }).addClass('cvat_canvas_shape');
+        image
+            .move(this.geometry.offset + left, this.geometry.offset + top)
+            .size(width, height);
+
+        imageDataToDataURL(
+            imageBitmap,
+            width,
+            height,
+            (dataURL: string): void => {
+                const destroy = (): void => URL.revokeObjectURL(dataURL);
+                if (image.parent() !== null) {
+                    image.loaded(destroy);
+                    image.error(destroy);
+                    image.load(dataURL);
+                } else {
+                    destroy();
+                }
+            },
+        );
+
+        if (state.occluded) {
+            image.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            image.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.isGroundTruth) {
+            image.addClass('cvat_canvas_ground_truth');
+        }
+
+        return image;
+    }
+
+    private addSkeleton(state: any): any {
+        const skeleton = (this.adoptedContent as any)
+            .group()
+            .attr({
+                clientID: state.clientID,
+                'color-rendering': 'optimizeQuality',
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                'data-z-order': state.zOrder,
+                'pointer-events': 'all',
+                ...this.getShapeColorization(state),
+            }).addClass('cvat_canvas_shape cvat_canvas_shape_skeleton') as SVG.G;
+
+        const SVGElement = makeSVGFromTemplate(state.label.structure.svg);
+
+        let [xtl, ytl, xbr, ybr] = [null, null, null, null];
+        const svgElements: Record<number, SVG.Element> = {};
+        const visibleElementIDs = this.getVisibleSkeletonElementIDs(state.clientID);
+        const visibleNodeIDs = new Set<string | number>();
+        const templateElements = Array.from(SVGElement.children()).filter((el: SVG.Element) => el.type === 'circle');
+        for (let i = 0; i < state.elements.length; i++) {
+            const element = state.elements[i];
+            if (visibleElementIDs && !visibleElementIDs.has(element.clientID)) {
+                continue;
+            }
+
+            if (element.shapeType === 'points') {
+                const points: number[] = element.points as number[];
+                const [cx, cy] = this.translateToCanvas(points);
+
+                if (!element.outside) {
+                    xtl = xtl === null ? cx : Math.min(xtl, cx);
+                    ytl = ytl === null ? cy : Math.min(ytl, cy);
+                    xbr = xbr === null ? cx : Math.max(xbr, cx);
+                    ybr = ybr === null ? cy : Math.max(ybr, cy);
+                }
+
+                const templateElement = templateElements.find((el: SVG.Circle) => el.attr('data-label-id') === element.label.id);
+                visibleNodeIDs.add(templateElement.attr('data-node-id'));
+                const circle = skeleton.circle()
+                    .center(cx, cy)
+                    .attr({
+                        id: `cvat_canvas_shape_${element.clientID}`,
+                        r: this.configuration.controlPointsSize / this.geometry.scale,
+                        'color-rendering': 'optimizeQuality',
+                        'shape-rendering': 'geometricprecision',
+                        'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                        'data-node-id': templateElement.attr('data-node-id'),
+                        'data-element-id': templateElement.attr('data-element-id'),
+                        'data-label-id': templateElement.attr('data-label-id'),
+                        'data-client-id': element.clientID,
+                        ...this.getShapeColorization(element, { parentState: state }),
+                    }).style({
+                        cursor: 'default',
+                    });
+                this.svgShapes[element.clientID] = circle;
+                if (element.occluded) {
+                    circle.addClass('cvat_canvas_shape_occluded');
+                }
+
+                if (element.hidden || element.outside || this.isInnerHidden(element.clientID)) {
+                    circle.addClass('cvat_canvas_hidden');
+                }
+
+                const mouseover = (e: MouseEvent): void => {
+                    const locked = this.drawnStates[state.clientID].lock;
+                    if (!locked && !e.ctrlKey && this.mode === Mode.IDLE) {
+                        circle.attr({
+                            'stroke-width': consts.POINTS_SELECTED_STROKE_WIDTH / this.geometry.scale,
+                        });
+
+                        const [x, y] = translateToSVG(this.content, [e.clientX, e.clientY]);
+                        const event: CustomEvent = new CustomEvent('canvas.moved', {
+                            bubbles: false,
+                            cancelable: true,
+                            detail: {
+                                x: x - this.geometry.offset,
+                                y: y - this.geometry.offset,
+                                activatedElementID: element.clientID,
+                                states: this.controller.objects,
+                            },
+                        });
+
+                        this.canvas.dispatchEvent(event);
+                    }
+                };
+
+                const mousemove = (e: MouseEvent): void => {
+                    if (this.mode === Mode.IDLE) {
+                        // stop propagation to canvas where it calls another canvas.moved
+                        // and does not allow to activate an element
+                        e.stopPropagation();
+                    }
+                };
+
+                const mouseleave = (): void => {
+                    circle.attr({
+                        'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                    });
+                };
+
+                const click = (e: MouseEvent): void => {
+                    e.stopPropagation();
+                    if (this.mode === Mode.SELECT) {
+                        this.onFindObject(e);
+                        return;
+                    }
+
+                    this.canvas.dispatchEvent(
+                        new CustomEvent('canvas.clicked', {
+                            bubbles: false,
+                            cancelable: true,
+                            detail: {
+                                state: element,
+                            },
+                        }),
+                    );
+                };
+
+                circle.on('mouseover', mouseover);
+                circle.on('mouseleave', mouseleave);
+                circle.on('mousemove', mousemove);
+                circle.on('click', click);
+                circle.on('remove', () => {
+                    circle.off('remove');
+                    circle.off('mouseover', mouseover);
+                    circle.off('mouseleave', mouseleave);
+                    circle.off('mousemove', mousemove);
+                    circle.off('click', click);
+                });
+
+                svgElements[element.clientID] = circle;
+            }
+        }
+
+        // if all elements were outside, set coordinates to zeros
+        xtl = xtl || 0;
+        ytl = ytl || 0;
+        xbr = xbr || 0;
+        ybr = ybr || 0;
+
+        // apply bounding box margin
+        xtl -= consts.SKELETON_RECT_MARGIN;
+        ytl -= consts.SKELETON_RECT_MARGIN;
+        xbr += consts.SKELETON_RECT_MARGIN;
+        ybr += consts.SKELETON_RECT_MARGIN;
+
+        skeleton.on('remove', () => {
+            Object.values(svgElements).forEach((element) => element.fire('remove'));
+            skeleton.off('remove');
+        });
+
+        const wrappingRect = skeleton.rect(xbr - xtl, ybr - ytl).move(xtl, ytl).attr({
+            fill: 'inherit',
+            'fill-opacity': 0,
+            'color-rendering': 'optimizeQuality',
+            'shape-rendering': 'geometricprecision',
+            stroke: 'inherit',
+            'stroke-width': 'inherit',
+            'data-xtl': xtl,
+            'data-ytl': ytl,
+            'data-xbr': xbr,
+            'data-ybr': ybr,
+        }).addClass('cvat_canvas_skeleton_wrapping_rect');
+
+        skeleton.node.prepend(wrappingRect.node);
+        setupSkeletonEdges(skeleton, SVGElement, visibleNodeIDs);
+
+        if (state.occluded) {
+            skeleton.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.isGroundTruth) {
+            skeleton.addClass('cvat_canvas_ground_truth');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            skeleton.addClass('cvat_canvas_hidden');
+        }
+
+        (skeleton as any).selectize = (enabled: boolean) => {
+            this.selectize(enabled, wrappingRect);
+            const handler = wrappingRect.remember('_selectHandler');
+            if (enabled && handler) {
+                this.adoptedContent.node.append(handler.nested.node);
+                handler.nested.attr('fill', skeleton.attr('fill'));
+            }
+
+            return skeleton;
+        };
+
+        return skeleton;
+    }
+
+    private setupPoints(basicPolyline: SVG.PolyLine, state: any | DrawnState): any {
+        this.selectize(true, basicPolyline);
+
+        const group: SVG.G = basicPolyline
+            .remember('_selectHandler')
+            .nested.addClass('cvat_canvas_shape')
+            .attr({
+                clientID: state.clientID,
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'data-polyline-id': basicPolyline.attr('id'),
+                'data-z-order': state.zOrder,
+            });
+
+        group.on('click.canvas', (event: MouseEvent): void => {
+            // Need to redispatch the event on another element
+            basicPolyline.fire(new MouseEvent('click', event));
+            if (this.mode === Mode.SELECT) {
+                event.stopPropagation();
+                this.onFindObject(event);
+                return;
+            }
+
+            // redispatch event to canvas to be able merge points clicking them
+            this.content.dispatchEvent(new MouseEvent('click', event));
+        });
+
+        group.bbox = basicPolyline.bbox.bind(basicPolyline);
+        group.clone = basicPolyline.clone.bind(basicPolyline);
+
+        return group;
+    }
+
+    private addEllipse(points: string, state: any): SVG.Rect {
+        const [cx, cy, rightX, topY] = points.split(/[/,\s]/g).map((coord) => +coord);
+        const [rx, ry] = [rightX - cx, cy - topY];
+        const rect = this.adoptedContent
+            .ellipse(rx * 2, ry * 2)
+            .attr({
+                clientID: state.clientID,
+                'color-rendering': 'optimizeQuality',
+                id: `cvat_canvas_shape_${state.clientID}`,
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': consts.BASE_STROKE_WIDTH / this.geometry.scale,
+                'data-z-order': state.zOrder,
+                ...this.getShapeColorization(state),
+            })
+            .center(cx, cy)
+            .addClass('cvat_canvas_shape');
+
+        if (state.rotation) {
+            rect.rotate(state.rotation);
+        }
+
+        if (state.occluded) {
+            rect.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            rect.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.isGroundTruth) {
+            rect.addClass('cvat_canvas_ground_truth');
+        }
+
+        return rect;
+    }
+
+    private addPoints(points: string, state: any): SVG.PolyLine {
+        const shape = this.adoptedContent
+            .polyline(points)
+            .attr({
+                'color-rendering': 'optimizeQuality',
+                'pointer-events': 'none',
+                'shape-rendering': 'geometricprecision',
+                'stroke-width': 0,
+                ...this.getShapeColorization(state),
+            }).style({
+                opacity: 0,
+            });
+
+        const group = this.setupPoints(shape, state);
+
+        if (state.hidden || state.outside || this.isInnerHidden(state.clientID)) {
+            group.addClass('cvat_canvas_hidden');
+        }
+
+        if (state.occluded) {
+            group.addClass('cvat_canvas_shape_occluded');
+        }
+
+        if (state.isGroundTruth) {
+            group.addClass('cvat_canvas_ground_truth');
+        }
+
+        shape.remove = (): SVG.PolyLine => {
+            this.selectize(false, shape);
+            shape.constructor.prototype.remove.call(shape);
+            return shape;
+        };
+
+        return shape;
+    }
+}

@@ -1,0 +1,177 @@
+{
+  "schema": "car-cam-processed-demo/v1",
+  "source_sha256": "e16ca826d6a9cbee6711983cc9c4c896073015d1ef6fffb93b39ef8c16bcd569",
+  "notebook_sha256": "61756c587e2a884786939ee7c62a6abaf0d506a75b50839177f4a794b8974857",
+  "classes": [
+    "car",
+    "person",
+    "bicycle",
+    "truck",
+    "bus",
+    "motorcycle"
+  ],
+  "reference_available": false,
+  "catalog_entry": {
+    "id": "kitti-0000-exp123-frames0-29",
+    "name": "kitti-0000-exp123-frames0-29.mp4",
+    "frame_count": 30,
+    "fps": 10.0,
+    "width": 1242,
+    "height": 374,
+    "track_count": 15,
+    "directory": "kitti-0000-exp123-frames0-29",
+    "source_sha256": "e16ca826d6a9cbee6711983cc9c4c896073015d1ef6fffb93b39ef8c16bcd569",
+    "result_sha256": "221a743f4f5f9389991045b05963b4c484882c3f5e85e297c1fc042ed0733c5d",
+    "data_source": "sam3-kaggle",
+    "checkpoint_sha256": "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e",
+    "model_version": "sam3@2345a4ad109ac29c569da749c91d84f10dc08c40"
+  },
+  "model_runtime": {
+    "environment": {
+      "schema": "autolabel-runtime/v1",
+      "versions": {
+        "python": "3.13.15",
+        "torch": "2.11.0+cu128",
+        "torchvision": "0.26.0+cu128",
+        "transformers": "5.16.1",
+        "cuda": "12.8",
+        "numpy": "2.1.3",
+        "sam3_commit": "2345a4ad109ac29c569da749c91d84f10dc08c40"
+      },
+      "gpu": {
+        "name": "Tesla T4",
+        "compute_capability": [
+          7,
+          5
+        ],
+        "total_vram_bytes": 15636037632
+      },
+      "nvidia_smi": "Fri Oct 30 04:51:54 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.178.04             Driver Version: 580.178.04     CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  Tesla T4                       Off |   00000000:00:04.0 Off |                    0 |\n| N/A   57C    P0             29W /   70W |    3801MiB /  15360MiB |      7%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n|   1  Tesla T4                       Off |   00000000:00:05.0 Off |                    0 |\n| N/A   51C    P8             12W /   70W |       3MiB /  15360MiB |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|    0   N/A  N/A              23      C   /usr/bin/python3                       3798MiB |\n+-----------------------------------------------------------------------------------------+\n",
+      "timing_s": {},
+      "peak_cuda_allocated_bytes": {}
+    },
+    "tracking_parameters": {
+      "schema": "autolabel-sam3-tracking-parameters/v1",
+      "parameters": {
+        "score_threshold_detection": {
+          "value": 0.5,
+          "availability": "observed",
+          "source_attribute": "model.score_threshold_detection"
+        },
+        "det_nms_thresh": {
+          "value": 0.1,
+          "availability": "observed",
+          "source_attribute": "model.det_nms_thresh"
+        },
+        "new_det_thresh": {
+          "value": 0.7,
+          "availability": "observed",
+          "source_attribute": "model.new_det_thresh"
+        },
+        "assoc_iou_thresh": {
+          "value": 0.1,
+          "availability": "observed",
+          "source_attribute": "model.assoc_iou_thresh"
+        },
+        "hotstart_delay": {
+          "value": 15,
+          "availability": "observed",
+          "source_attribute": "model.hotstart_delay"
+        },
+        "hotstart_unmatch_thresh": {
+          "value": 8,
+          "availability": "observed",
+          "source_attribute": "model.hotstart_unmatch_thresh"
+        },
+        "hotstart_dup_thresh": {
+          "value": 8,
+          "availability": "observed",
+          "source_attribute": "model.hotstart_dup_thresh"
+        },
+        "recondition_every_nth_frame": {
+          "value": 16,
+          "availability": "observed",
+          "source_attribute": "model.recondition_every_nth_frame"
+        },
+        "init_trk_keep_alive": {
+          "value": 30,
+          "availability": "observed",
+          "source_attribute": "model.init_trk_keep_alive"
+        },
+        "max_trk_keep_alive": {
+          "value": 30,
+          "availability": "observed",
+          "source_attribute": "model.max_trk_keep_alive"
+        },
+        "min_trk_keep_alive": {
+          "value": -1,
+          "availability": "observed",
+          "source_attribute": "model.min_trk_keep_alive"
+        },
+        "decrease_keep_alive_for_empty_masklets": {
+          "value": null,
+          "availability": "unavailable",
+          "source_attribute": "model.decrease_keep_alive_for_empty_masklets"
+        },
+        "num_maskmem": {
+          "value": 7,
+          "availability": "observed",
+          "source_attribute": "model.tracker.num_maskmem"
+        },
+        "use_memory_selection": {
+          "value": true,
+          "availability": "observed",
+          "source_attribute": "model.tracker.use_memory_selection"
+        },
+        "mf_threshold": {
+          "value": 0.01,
+          "availability": "observed",
+          "source_attribute": "model.tracker.mf_threshold"
+        },
+        "memory_temporal_stride_for_eval": {
+          "value": 1,
+          "availability": "observed",
+          "source_attribute": "model.tracker.memory_temporal_stride_for_eval"
+        },
+        "max_cond_frames_in_attn": {
+          "value": 4,
+          "availability": "observed",
+          "source_attribute": "model.tracker.max_cond_frames_in_attn"
+        },
+        "max_obj_ptrs_in_encoder": {
+          "value": 16,
+          "availability": "observed",
+          "source_attribute": "model.tracker.max_obj_ptrs_in_encoder"
+        },
+        "trim_past_non_cond_mem_for_eval": {
+          "value": false,
+          "availability": "observed",
+          "source_attribute": "model.tracker.trim_past_non_cond_mem_for_eval"
+        }
+      },
+      "scope": "Observed scalar attributes; no inference/state probing; historical artifacts unchanged"
+    },
+    "memory_selection": {
+      "policy": "group"
+    },
+    "checkpoint_sha256": "9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e",
+    "model_variant": "sam3",
+    "sam3_detection_thresholds": {
+      "score_threshold_detection": 0.5,
+      "new_det_thresh": 0.7
+    },
+    "dtype": "fp16",
+    "autocast": "cuda",
+    "peak_cuda_allocated_bytes_by_device": {
+      "0": 3748510720,
+      "1": 0
+    },
+    "peak_cuda_allocated_bytes": 3748510720,
+    "mask_to_box_fallbacks": 0,
+    "timing_s": {
+      "model_load": 81.176245975
+    }
+  },
+  "processed_at": "2026-10-30T04:57:47.366386+00:00",
+  "result_sha256": "ed745a1c9c86ecd27798a9de6861a5c6287a3b48edeef30aaeda5d4a2778f044"
+}
